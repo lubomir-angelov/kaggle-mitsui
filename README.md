@@ -32,11 +32,29 @@ The ideas are inspired by:
 
 
 ## Plan for entries
-- Use a lgtbm as a first attempt
+- ~~Use a lgtbm as a first attempt~~ 
+    - added lightgm with sharpe score approximately 0.432
+    - tried out cuda to speed up the model
+    - lightGBM does not support CUDA on windows see [here](https://github.com/microsoft/LightGBM/issues/3837)
+    - installing with 
+    ```bash
+        pip uninstall lightgbm
+        pip install lightgbm --no-binary lightgbm --config-settings=cmake.define.USE_CUDA=ON
+    ```
+        on the notebook cluster also led to the same errors:
+    ```bash
+        LightGBMError: GPU Tree Learner was not enabled in this build.
+        Please recompile with CMake option -DUSE_GPU=1
+        add Codeadd Markdown
+    ```
+    This is now too much effort to resolve, moving on the TimeXer
 - Implement TimeXer or one of the other transformers found in the [Time Series Library](https://github.com/thuml/Time-Series-Library?tab=readme-ov-file)
+    - train locally and produce weight/checkpoints
+    - implement "Aurora Tricks"
+    - upload weights/checkpoints in Kaggle and load the model from those, then perform predictions with the MitsuiInference server
 - Perform additional steps on the TimXer
 
-### "Add Aurora tricks"
+### "Aurora tricks"
  TimeXer is a plain-Transformer backbone with patch-wise self-attention plus variate-wise cross-attention, so the same three Aurora-style tricks—
 
 1. **Patch-3-D tokenisation**
@@ -46,6 +64,7 @@ The ideas are inspired by:
 —drop straight into the TimeXer pipeline with only minor wiring changes.
 
 ---
+## TimeXer with Aurora architecture add-ons
 
 ## 1 Why the fit is natural
 
