@@ -1,0 +1,2 @@
+kaggle==1.7.4.5
+requests==2.32.4
