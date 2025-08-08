@@ -41,13 +41,14 @@ The ideas are inspired by:
         pip uninstall lightgbm
         pip install lightgbm --no-binary lightgbm --config-settings=cmake.define.USE_CUDA=ON
     ```
-        on the notebook cluster also led to the same errors:
+    On the notebook cluster also led to the same errors:
+
     ```bash
         LightGBMError: GPU Tree Learner was not enabled in this build.
         Please recompile with CMake option -DUSE_GPU=1
         add Codeadd Markdown
     ```
-    This is now too much effort to resolve, moving on the TimeXer
+    This is now too much effort to resolve, moving on to the TimeXer idea
 - Implement TimeXer or one of the other transformers found in the [Time Series Library](https://github.com/thuml/Time-Series-Library?tab=readme-ov-file)
     - train locally and produce weight/checkpoints
     - implement "Aurora Tricks"
