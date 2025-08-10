@@ -199,6 +199,8 @@ def _resample_to_business_daily(df: pd.DataFrame) -> pd.DataFrame:
         if not rows:
             return pd.DataFrame(columns=["date", "price_close"])
         out = pd.DataFrame(rows, columns=["date", "price_close"]).set_index("date")
+        # ensure numeric to avoid object-dtype ffill warnings
+        out["price_close"] = pd.to_numeric(out["price_close"], errors="coerce")
         return out
 
     def _resample_group(g: pd.DataFrame) -> pd.DataFrame:
@@ -213,7 +215,10 @@ def _resample_to_business_daily(df: pd.DataFrame) -> pd.DataFrame:
             base = g.resample("MS").last()
             placed = _place_first_bday(ms, base["price_close"])
             bcal = _first_bday_range(start, end)
-            out = placed.reindex(bcal).ffill()
+            out = placed.reindex(bcal)
+            # avoid FutureWarning: make sure value col is numeric, then ffill
+            out["price_close"] = pd.to_numeric(out["price_close"], errors="coerce")
+            out = out.ffill()
 
         elif freq == "Q":
             qs = pd.date_range(start=start, end=end, freq="QS")
@@ -229,8 +234,8 @@ def _resample_to_business_daily(df: pd.DataFrame) -> pd.DataFrame:
             out = out.reindex(bcal).ffill()
 
         elif freq == "A":
-            ys = pd.date_range(start=start, end=end, freq="AS")
-            base = g.resample("AS").last()
+            ys = pd.date_range(start=start, end=end, freq="YS")
+            base = g.resample("YS").last()
             rows = []
             for ts, val in zip(ys, base["price_close"].reindex(ys)):
                 fb = pd.date_range(start=ts, end=ts + relativedelta(years=1, days=-1), freq=BUSINESS_CALENDAR_FREQ)
@@ -252,11 +257,31 @@ def _resample_to_business_daily(df: pd.DataFrame) -> pd.DataFrame:
         out["src"] = g["src"].iloc[0]
         out["unit"] = g["unit"].iloc[0] if "unit" in g.columns else "USD"
         out["frequency"] = "D"
-        return out.reset_index().rename(columns={"index": "date"})
 
-    parts = [ _resample_group(g) for _, g in df.groupby("symbol", sort=False) ]
-    out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=CANON_COLUMNS)
+        out = out.reset_index().rename(columns={"index": "date"})
+        # enforce unique columns + canonical order to avoid concat crash
+        out = out.loc[:, ~pd.Index(out.columns).duplicated()].copy()
+        out = out.reindex(columns=["date", "symbol", "price_close", "src", "unit", "frequency"])
+
+        return out
+
+    # Group by symbol, resample each group, guard against duplicates
+    parts = []
+    for _, g in df.groupby("symbol", sort=False):
+        pg = _resample_group(g)
+        if pg is None or pg.empty:
+            continue
+        # double-guard against dup columns
+        if not pd.Index(pg.columns).is_unique:
+            pg = pg.loc[:, ~pd.Index(pg.columns).duplicated()].copy()
+        parts.append(pg)
+
+    if not parts:
+        return pd.DataFrame(columns=CANON_COLUMNS)
+
+    out = pd.concat(parts, ignore_index=True)
     out = out.dropna(subset=["date", "symbol", "price_close"]).sort_values(["symbol", "date"]).reset_index(drop=True)
+
     return out
 
 
@@ -900,51 +925,105 @@ def adapt_eia_mer_folder(folder: Path, symbol_map: Dict[str, str]) -> pd.DataFra
 
 def adapt_kaggle_etf_stock(folder: Path, symbol_map: Dict[str, str]) -> pd.DataFrame:
     """
-    Adapt US stocks/ETFs dataset: produce daily close for symbols that look like commodities/ETFs.
-    This is auxiliary (cross-asset covariates), not core commodity series.
+    Adapt Kaggle ETFs/Stocks text files into [date, symbol, price_close, src, unit, frequency].
+
+    - Supports *.txt and *.csv
+    - Supports both .../Data/ETFs and .../ETFs (and likewise for Stocks)
+    - By default, only keeps commodity-oriented ETFs (set below). Change the allowlist
+      or set it to None to ingest everything.
     """
     if not folder.exists():
         logger.info("ETF/Stock folder not found: %s", folder)
         return pd.DataFrame(columns=CANON_COLUMNS)
 
+    # ---- Adjust this allowlist to your taste (or set to None to take all ETFs) ----
+    commodity_etf_allowlist = {
+        "GLD","SLV","PPLT","PALL",                 # precious metals
+        "DBC","GSG","DJP",                         # broad commodity indices
+        "DBB","JJC","CPER",                        # base metals (broad/copper)
+        "USO","BNO","UNG","UGA",                   # energy (oil/NG/gasoline)
+        "DBA","SOYB","WEAT","CORN","CANE","JO","WOOD"  # ags & timber
+    }
+    keep_only_etfs = True  # flip to False if you also want Stocks
+
     logger.info("Parsing ETF/Stock price files from %s", folder)
+
+    paths = (
+        list(folder.rglob("**/*.txt")) +
+        list(folder.rglob("**/*.csv"))
+    )
+    if not paths:
+        logger.info("No ETF/Stock files found under %s", folder)
+        return pd.DataFrame(columns=CANON_COLUMNS)
+
     parts: List[pd.DataFrame] = []
-    for p in sorted(folder.rglob("*.csv")):
+
+    for p in sorted(paths):
+        # optionally ignore stocks
+        if keep_only_etfs and not any("etf" in part.lower() for part in p.parts):
+            continue
+
+        # read
         try:
-            df = pd.read_csv(p)
-        except Exception:
+            if p.suffix.lower() == ".csv":
+                df = pd.read_csv(p, low_memory=False)
+            else:
+                # Kaggle .txt files are plain CSV
+                df = pd.read_csv(p, low_memory=False)
+        except Exception as e:
+            logger.debug("Skip unreadable file %s: %s", p, e)
             continue
         if df.empty:
             continue
 
-        # Must have date and close
-        dcol = next((c for c in df.columns if c in DATE_COL_NAMES), None)
-        pcol = next((c for c in df.columns if c in ("Close", "Adj Close", "PX_LAST", "close")), None)
-        sym_col = next((c for c in df.columns if c.lower() in ("symbol", "ticker")), None)
-
-        if not dcol or not pcol:
+        # date column
+        dcol = next((c for c in df.columns if str(c).lower() in {"date","datetime","time"}), None)
+        if dcol is None:
             continue
 
-        if sym_col:
-            raw_symbol = df[sym_col].astype(str)
-        else:
-            raw_symbol = pd.Series([p.stem] * len(df))
+        # price column: prefer Adj Close if present
+        price_candidates = ["Adj Close", "adj close", "adj_close", "Close", "close", "PX_LAST", "price"]
+        pcol = next((c for c in price_candidates if c in df.columns), None)
+        if pcol is None:
+            # last numeric as fallback
+            num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            pcol = num_cols[-1] if num_cols else None
+        if pcol is None:
+            continue
 
-        tmp = pd.DataFrame(
-            {
-                "date": _coerce_datetime(df[dcol]),
-                "symbol": [ _canonicalize_symbol(s, symbol_map) for s in raw_symbol ],
-                "price_close": pd.to_numeric(df[pcol], errors="coerce"),
-                "src": "kaggle_etf_stock",
-                "unit": "USD",
-                "frequency": "D",
-            }
-        )
-        tmp = tmp.dropna(subset=["date", "symbol", "price_close"])
+        # symbol from filename (e.g., 'gld.us.txt' -> 'GLD')
+        stem = p.stem  # e.g., 'gld.us'
+        base = stem.split(".")[0] if "." in stem else stem
+        ticker = base.upper().strip()
+
+        # optional filter to commodity ETFs
+        if commodity_etf_allowlist is not None and ticker not in commodity_etf_allowlist:
+            # if you're keeping all ETFs, set commodity_etf_allowlist = None above
+            continue
+
+        tmp = pd.DataFrame({
+            "date": pd.to_datetime(df[dcol], errors="coerce", utc=False).dt.tz_localize(None),
+            "symbol": _canonicalize_symbol(ticker, symbol_map),
+            "price_close": pd.to_numeric(df[pcol], errors="coerce"),
+            "src": "kaggle_etf_stock",
+            "unit": "USD",
+            "frequency": "D",
+        }).dropna(subset=["date","price_close"])
+
         parts.append(tmp)
 
-    out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=CANON_COLUMNS)
+    if not parts:
+        logger.info("No rows from kaggle_etf_stock")
+        return pd.DataFrame(columns=CANON_COLUMNS)
+
+    out = pd.concat(parts, ignore_index=True)
+
+    # De-dupe in case the same ticker exists in multiple folders
+    out = (out.sort_values(["symbol","date"])
+              .drop_duplicates(subset=["symbol","date"], keep="last"))
+
     out = _finalize_frame(out, src="kaggle_etf_stock", unit_default="USD")
+    logger.info("Got %d rows from kaggle_etf_stock (files scanned=%d)", len(out), len(paths))
     return out
 
 
