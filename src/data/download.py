@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -50,6 +51,7 @@ import zipfile
 from pathlib import Path
 from typing import List
 
+from bs4 import BeautifulSoup
 import requests
 
 try:
@@ -138,21 +140,27 @@ def download_commodity_prices_kaggle(force: bool):
 
 
 def download_agri_prices_kaggle(force: bool):
-    kaggle_download("bmsatish23/agricultural-commodities-price-data", RAW_DIR / "kaggle_agri_prices", force)
+    kaggle_download("syedjaferk/agriculture-commodity-data-2019", RAW_DIR / "kaggle_agri_prices_2019", force)
 
 
 def download_etf_stock_dataset(force: bool):
     kaggle_download("borismarjanovic/price-volume-data-for-all-us-stocks-etfs", RAW_DIR / "kaggle_etf_stock", force)
 
 
-def download_worldbank_pink_sheet(force: bool):
-    dest = RAW_DIR / "worldbank_pinksheet" / "pinksheet_latest.xlsx"
-    if skip_if_exists(dest, force):
-        return
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    url = "https://api.worldbank.org/v2/en/commodity/price?downloadformat=excel"
-    logger.info("Fetching World Bank Pink Sheet from %s", url)
-    stream_download(url, dest)
+
+def download_world_bank_pink_sheet(force: bool):
+    """
+
+    monthly https://thedocs.worldbank.org/en/doc/18675f1d1639c7a34d463f59263ba0a2-0050012025/related/CMO-Historical-Data-Monthly.xlsx
+    annual https://thedocs.worldbank.org/en/doc/18675f1d1639c7a34d463f59263ba0a2-0050012025/related/CMO-Historical-Data-Annual.xlsx
+
+    Historical data is available at e.g.:
+    https://bit.ly/CMO-October-2024-Data
+    """
+
+    logger.info("The World Bank data needs to be downaloaded manually! See here https://www.worldbank.org/en/research/commodity-markets#1")
+
+        
 
 
 def download_commodity_prediction_repo(force: bool):
@@ -165,31 +173,88 @@ def download_commodity_prediction_repo(force: bool):
 
 
 def download_energy_eia(force: bool):
-    url = "https://www.eia.gov/totalenergy/data/browser/xls/mer.xls"
-    dest = RAW_DIR / "eia_energy" / "mer.xls"
-    if skip_if_exists(dest, force):
+    """
+    # Note for the adapter:
+    # - Prefer reading .xlsx with engine='openpyxl'
+    # - If you see .xls (rare nowadays), use engine='xlrd' and ensure xlrd==1.2.0
+    # - You can also skip Excel entirely and fetch per-table CSVs from the MER page.
+    
+    Download the current EIA Monthly Energy Review (MER) tables as a ZIP and extract them.
+
+    Saves:
+      data/raw/eia_energy/mer_all_tables.zip
+      data/raw/eia_energy/mer_zip/  (unzipped tables: .xlsx / .csv)
+    """
+    import re
+    from bs4 import BeautifulSoup
+
+    base = "https://www.eia.gov/totalenergy/data/monthly/"
+    dest_dir = RAW_DIR / "eia_energy"
+    zip_path = dest_dir / "mer_all_tables.zip"
+    extract_dir = dest_dir / "mer_zip"
+
+    # idempotency
+    if zip_path.exists() and extract_dir.exists() and not force:
+        logger.info("EIA MER already present → skip (use --force to overwrite)")
         return
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Downloading EIA Monthly Energy Review XLS")
-    stream_download(url, dest)
 
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    if extract_dir.exists() and force:
+        shutil.rmtree(extract_dir)
 
-def download_mvts(force: bool):
-    repo_url = "https://github.com/Time-series-MvTS/MvTS.git"
-    folder = RAW_DIR / "mvts_benchmark"
-    if skip_if_exists(folder, force):
-        return
-    logger.info("Cloning %s", repo_url)
-    run(["git", "clone", "--depth", "1", repo_url, str(folder)])
+    logger.info("Fetching EIA Monthly Energy Review landing page…")
+    resp = requests.get(base, timeout=30)
+    resp.raise_for_status()
 
+    soup = BeautifulSoup(resp.text, "html.parser")
 
-def download_finmultitime(force: bool):
-    repo_url = "https://huggingface.co/datasets/finmultitime"
-    folder = RAW_DIR / "finmultitime"
-    if skip_if_exists(folder, force):
-        return
-    logger.info("Cloning FinMultiTime via Git LFS (requires git‑lfs)")
-    run(["git", "clone", repo_url, str(folder)])
+    # Look for the “Download all tables ZIP” anchor; href usually ends with MER_Excel_Zip.zip
+    zip_href = None
+    for a in soup.find_all("a", href=True):
+        text = (a.get_text() or "").strip().lower()
+        href = a["href"]
+        if "download all tables" in text and href.lower().endswith(".zip"):
+            zip_href = href
+            break
+    if not zip_href:
+        # fallback: any .zip with MER in path
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.lower().endswith(".zip") and ("mer" in href.lower() or "zip_excel_month_end" in href.lower()):
+                zip_href = href
+                break
+
+    if not zip_href:
+        raise RuntimeError("Could not locate MER ZIP on the EIA page; the page layout may have changed.")
+
+    if not zip_href.startswith("http"):
+        zip_href = requests.compat.urljoin(base, zip_href)
+
+    logger.info("Downloading MER ZIP: %s", zip_href)
+    with requests.get(zip_href, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        ctype = r.headers.get("Content-Type", "").lower()
+        # Basic safety: fail if we’re not getting a real zip
+        if "zip" not in ctype and not zip_href.lower().endswith(".zip"):
+            text_sample = r.content[:500].decode("utf-8", errors="ignore")
+            raise RuntimeError(
+                f"Expected a ZIP but got Content-Type={ctype}. "
+                f"First bytes:\n{text_sample[:300]}…"
+            )
+        with open(zip_path, "wb") as f:
+            for chunk in r.iter_content(1 << 15):
+                if chunk:
+                    f.write(chunk)
+
+    logger.info("Extracting MER tables → %s", extract_dir)
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(extract_dir)
+
+    logger.info("EIA MER downloaded and extracted. Examples inside: .xlsx and/or .csv table files.")
+
+    
+
 
 ############################################################
 # CLI                                                      #
@@ -199,11 +264,9 @@ ALL_SOURCES = {
     "kaggle_commodities": download_commodity_prices_kaggle,
     "kaggle_agri": download_agri_prices_kaggle,
     "kaggle_etf": download_etf_stock_dataset,
-    "worldbank": download_worldbank_pink_sheet,
+    "worldbank": download_world_bank_pink_sheet,
     "repo_prediction": download_commodity_prediction_repo,
     "eia": download_energy_eia,
-    "mvts": download_mvts,
-    "finmultitime": download_finmultitime,
 }
 
 
@@ -232,4 +295,5 @@ def main():
 
 
 if __name__ == "__main__":
+    download_world_bank_pink_sheet(force=True)  # Ensure the Pink Sheet is downloaded first
     main()
