@@ -396,7 +396,7 @@ def adapt_worldbank_pink_sheet_folder(folder: Path, symbol_map: Dict[str, str]) 
                     # melt safely (id_vars must be *unique* column names)
                     slim = slim.loc[:, ~slim.columns.duplicated()].copy()
                     long = slim.melt(id_vars=[dname], var_name="series", value_name="price_close")
-                    long["date"] = pd.to_datetime(long[dname], errors="coerce")
+                    long["date"] = pd.to_datetime(df[dname], errors="coerce", utc=False, format="mixed")
                     long = long.dropna(subset=["date"])
                     base = f"{xlsx.stem} | {sname}"
                     long["raw_symbol"] = base + " | " + long["series"].astype(str)
@@ -418,8 +418,13 @@ def adapt_worldbank_pink_sheet_folder(folder: Path, symbol_map: Dict[str, str]) 
                 long["month_num"] = long["month_name"].map(lambda x: month_map.get(x.split("|")[0].strip().lower(), np.nan))
                 long = long.dropna(subset=["month_num"])
                 long["date"] = pd.to_datetime(
-                    dict(year=pd.to_numeric(long[year_col], errors="coerce"), month=long["month_num"].astype(int), day=1),
-                    errors="coerce"
+                    dict(year=pd.to_numeric(long[year_col], 
+                                            errors="coerce"), 
+                            month=long["month_num"].astype(int), 
+                            day=1,
+                            format="mixed"),
+                    errors="coerce",
+                    format="mixed"
                 )
                 long = long.dropna(subset=["date"])
                 base = f"{xlsx.stem} | {sname}"
@@ -445,7 +450,7 @@ def adapt_worldbank_pink_sheet_folder(folder: Path, symbol_map: Dict[str, str]) 
                     name_cols = ["Series"]
                 slim = slim.loc[:, ~slim.columns.duplicated()].copy()
                 long = slim.melt(id_vars=name_cols, var_name="year", value_name="price_close")
-                long["date"] = pd.to_datetime(long["year"].astype(str) + "-01-01", errors="coerce")
+                long["date"] = pd.to_datetime(long["year"].astype(str) + "-01-01", errors="coerce", format="mixed")
                 long = long.dropna(subset=["date"])
                 long["raw_symbol"] = long[name_cols[0]].astype(str)
                 long["symbol"] = long["raw_symbol"].map(lambda s: _canonicalize_symbol(s, symbol_map))
@@ -656,16 +661,13 @@ def adapt_agri_prices_kaggle(folder: Path, symbol_map: Dict[str, str]) -> pd.Dat
 
 def adapt_eia_mer_folder(folder: Path, symbol_map: Dict[str, str]) -> pd.DataFrame:
     """
-    Parse *all* EIA MER tables from a folder (CSV/XLSX/XLS).
-    Heuristics handled:
-      - Annual wide (Year, 1990..2025...)
-      - Monthly wide (Year, Jan..Dec)
-      - Tidy (Year + Month columns)
-      - Multi-series tables (uses a 'name' column if present; else builds from file/sheet)
-
-    Returns: [date, symbol, price_close, src, unit, frequency]
-    (frequency: 'M' for monthly, 'A' for annual)
+    Parse EIA Monthly Energy Review (MER) tables exported by download.py into long tidy rows.
+    Handles the common MER shape: banner rows, header row, *units* row, then data.
+    Sheets parsed: 'Monthly Data' (frequency='M') and 'Annual Data' (frequency='A').
     """
+    import re
+    import numpy as np
+    import pandas as pd
 
     if not folder.exists():
         logger.info("EIA MER folder missing: %s", folder)
@@ -678,303 +680,217 @@ def adapt_eia_mer_folder(folder: Path, symbol_map: Dict[str, str]) -> pd.DataFra
         logger.info("No MER files in %s", folder)
         return pd.DataFrame(columns=CANON_COLUMNS)
 
-    month_map = {
-        "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
-        "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
-        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
-        "oct":10, "october":10, "nov":11, "november":11, "dec":12, "december":12,
-    }
-    re_year  = re.compile(r"^\d{4}$")
-    re_monthcode = re.compile(r"^(\d{4})[-/]?([01]\d)$")  # e.g., 2024-07 or 202407
+    def _uniquify(cols: list[str]) -> list[str]:
+        seen, out = {}, []
+        for c in cols:
+            k = str(c)
+            if k in seen:
+                seen[k] += 1
+                out.append(f"{k}__{seen[k]}")
+            else:
+                seen[k] = 0
+                out.append(k)
+        return out
 
-    def _flatten_cols(df: pd.DataFrame) -> list[str]:
-        df.columns = [
-            "_".join(map(str, c)).strip() if isinstance(c, tuple) else str(c).strip()
-            for c in df.columns
+    def _looks_like_units(texts: list[str]) -> bool:
+        if not texts:
+            return False
+        keys = [
+            "btu","barrel","dollar","percent","cubic","short","tons",
+            "bcm","gwh","quadrillion","million","billion","per","british"
         ]
-        return [str(c) for c in df.columns]
+        hits = sum(("(" in t or ")" in t or any(k in t.lower() for k in keys)) for t in texts)
+        return hits / len(texts) >= 0.5
 
-    def _pick_name_cols(df: pd.DataFrame, ycol: str | None) -> list[str]:
-        # Prefer semantic name columns; else any object cols except Year/Month.
-        candidates = [
-            "Series", "Series Name", "Description", "Commodity", "Product",
-            "MSN", "Category", "Region", "Area", "Data Series", "Label", "Name"
-        ]
-        cols = list(df.columns)
-        low  = [c.lower() for c in cols]
-        for c in candidates:
-            if c in cols:
-                return [c]
-            if c.lower() in low:
-                return [cols[low.index(c.lower())]]
-        obj_cols = df.select_dtypes(include=["object"]).columns.tolist()
-        obj_cols = [c for c in obj_cols if c != ycol and c.lower() not in ("year", "month", "date")]
-        # cap to 2 to avoid over-IDs
-        return obj_cols[:2]
+    def _units_row_to_map(df: pd.DataFrame, row_idx: int, ncols: int) -> dict[int, str]:
+        if row_idx is None or row_idx >= len(df):
+            return {}
+        row = df.iloc[row_idx].astype(str).tolist()[:ncols]
+        return {i: (s.strip() if str(s).strip().lower() != "nan" else None) for i, s in enumerate(row)}
 
-    def _rows_to_symbol(row: pd.Series, name_cols: list[str], fallback: str) -> str:
-        if name_cols:
-            parts = [str(row[c]) for c in name_cols if pd.notna(row.get(c)) and str(row[c]).strip()]
-            if parts:
-                return " / ".join(parts)
-        return fallback
+    def _parse_monthly(df: pd.DataFrame, file_stem: str) -> Optional[pd.DataFrame]:
+        # find header row (line with 'Month' or 'Year and Month')
+        header_row = None
+        for i in range(min(80, len(df))):
+            row = df.iloc[i].astype(str).str.strip().tolist()
+            rl = [c.lower() for c in row]
+            if any(c == "month" for c in rl) or any("year and month" in c for c in rl):
+                header_row = i
+                break
+        # fallback: first row whose col0 looks like "YYYY Month"
+        if header_row is None:
+            patt = re.compile(r"^\s*\d{4}\s+[A-Za-z]+")
+            for i in range(min(80, len(df))):
+                if patt.match(str(df.iloc[i, 0])):
+                    header_row = max(i - 3, 0)
+                    break
+        if header_row is None:
+            return None
+
+        cols_raw = df.iloc[header_row].astype(str).tolist()
+        cols = _uniquify(cols_raw)
+        date_col = next((c for c in cols if "month" in c.lower()), None) or "Year and Month"
+        cols[0] = date_col  # ensure the first column is the date label
+
+        # data start: first row after header with "YYYY Month"
+        patt = re.compile(r"^\s*\d{4}\s+[A-Za-z]+")
+        data_start = None
+        for i in range(header_row + 1, len(df)):
+            if patt.match(str(df.iloc[i, 0])):
+                data_start = i
+                break
+        if data_start is None:
+            return None
+
+        data = df.iloc[data_start:].copy()
+        base_cols = cols[: len(data.columns)]
+        if len(base_cols) < len(data.columns):
+            base_cols += [f"col_{i}" for i in range(len(base_cols), len(data.columns))]
+        data.columns = base_cols
+
+        # units
+        units_map_idx = _units_row_to_map(df, header_row + 1, len(base_cols))
+        # parse date
+        ser = data[date_col].astype(str).str.strip()
+        d1 = pd.to_datetime(ser, format="%Y %B", errors="coerce")
+        if d1.isna().mean() > 0.5:
+            d1 = pd.to_datetime(ser, format="%Y %b", errors="coerce")
+        if d1.isna().mean() > 0.5:
+            d1 = pd.to_datetime(ser, errors="coerce")
+        data["date"] = d1
+        data = data.dropna(subset=["date"])
+
+        value_cols = [c for c in data.columns if c not in (date_col, "date")]
+        parts = []
+        unit_for = {}
+        for idx, c in enumerate(value_cols):
+            s = pd.to_numeric(data[c], errors="coerce")
+            if s.notna().sum() == 0:
+                continue
+            tmp = pd.DataFrame(
+                {"date": data["date"], "raw_symbol": c, "price_close": s, "unit": units_map_idx.get(idx)}
+            )
+            parts.append(tmp)
+            unit_for[c] = units_map_idx.get(idx)
+
+        if not parts:
+            return None
+        out = pd.concat(parts, ignore_index=True)
+        out["symbol"] = out["raw_symbol"].map(lambda s: _canonicalize_symbol(str(s), symbol_map))
+        out["src"] = "eia_mer"
+        out["frequency"] = "M"
+        return out[["date", "symbol", "price_close", "src", "unit", "frequency"]]
+
+    def _parse_annual(df: pd.DataFrame, file_stem: str) -> Optional[pd.DataFrame]:
+        # find first row where col0 is a 4-digit year
+        year_idx = None
+        for i in range(min(200, len(df))):
+            v = str(df.iloc[i, 0]).strip()
+            if re.fullmatch(r"\d{4}", v):
+                year_idx = i
+                break
+        if year_idx is None:
+            for i in range(min(200, len(df))):
+                val = df.iloc[i, 0]
+                if isinstance(val, (int, float)) and not pd.isna(val) and 1900 <= int(val) <= 2100:
+                    year_idx = i
+                    break
+        if year_idx is None:
+            return None
+
+        # header row = closest non-unit text row above year_idx
+        header_row = None
+        for j in range(year_idx - 1, max(-1, year_idx - 8), -1):
+            row = df.iloc[j].tolist()
+            texts = [str(x).strip() for x in row[:40] if isinstance(x, str) and x.strip()]
+            if len(texts) >= 2 and not _looks_like_units(texts):
+                header_row = j
+                break
+        if header_row is None:
+            header_row = max(0, year_idx - 1)
+
+        cols_raw = df.iloc[header_row].astype(str).tolist()
+        cols = _uniquify(cols_raw)
+
+        data = df.iloc[year_idx:].copy()
+        base_cols = cols[: len(data.columns)]
+        if len(base_cols) < len(data.columns):
+            base_cols += [f"col_{i}" for i in range(len(base_cols), len(data.columns))]
+        data.columns = base_cols
+
+        # Year column name can be 'Year', 'End of Year', etc.
+        year_candidates = [c for c in data.columns if "year" in str(c).lower()]
+        ycol = year_candidates[0] if year_candidates else data.columns[0]
+
+        # units
+        units_map_idx = _units_row_to_map(df, header_row + 1, len(base_cols))
+
+        y = pd.to_numeric(data[ycol], errors="coerce").astype("Int64")
+        data["date"] = pd.to_datetime(y.astype(str) + "-01-01", errors="coerce")
+        data = data.dropna(subset=["date"])
+
+        value_cols = [c for c in data.columns if c not in (ycol, "date")]
+        parts = []
+        for i, c in enumerate(value_cols):
+            s = pd.to_numeric(data[c], errors="coerce")
+            if s.notna().sum() == 0:
+                continue
+            tmp = pd.DataFrame(
+                {"date": data["date"], "raw_symbol": c, "price_close": s, "unit": units_map_idx.get(i)}
+            )
+            parts.append(tmp)
+
+        if not parts:
+            return None
+        out = pd.concat(parts, ignore_index=True)
+        out["symbol"] = out["raw_symbol"].map(lambda s: _canonicalize_symbol(str(s), symbol_map))
+        out["src"] = "eia_mer"
+        out["frequency"] = "A"
+        return out[["date", "symbol", "price_close", "src", "unit", "frequency"]]
 
     frames: list[pd.DataFrame] = []
 
-    def _read_sheets_any_header(path: Path) -> dict[str, pd.DataFrame]:
-        """Try several header rows; return {sheet_name: DataFrame}."""
-        out = {}
-        if path.suffix.lower() == ".csv":
-            try:
-                df = pd.read_csv(path, low_memory=False)
-                out[path.stem] = df
-            except Exception as e:
-                logger.debug("CSV read failed %s: %s", path.name, e)
-            return out
-
-        # Excel: sweep header rows 0..10
-        engine = "openpyxl" if path.suffix.lower() in (".xlsx", ".xlsm") else "xlrd"
-        for hdr in range(0, 11):
-            try:
-                sheets = pd.read_excel(path, sheet_name=None, header=hdr, engine=engine)
-                if not isinstance(sheets, dict):
-                    continue
-                # accept sheets that have a Year col or >=3 month cols or 4-digit year columns
-                accepted = {}
-                for sname, df0 in sheets.items():
-                    if not isinstance(df0, pd.DataFrame) or df0.empty:
-                        continue
-                    cols0 = [str(c).strip() for c in df0.columns]
-                    low0  = [c.lower() for c in cols0]
-                    has_year = "year" in low0
-                    month_count = sum(1 for c in low0 if c in month_map)
-                    has_yearcols = any(re_year.match(str(c)) for c in cols0)
-                    if has_year or month_count >= 3 or has_yearcols:
-                        accepted[sname] = df0
-                if accepted:
-                    out.update(accepted)
-                    # keep going; sometimes different sheets need different header rows
-            except Exception:
-                pass
-
-        # Fallback: header=None and try to promote header row
-        if not out:
-            try:
-                raw = pd.read_excel(path, sheet_name=None, header=None, engine=engine)
-                for sname, df0 in raw.items():
-                    if not isinstance(df0, pd.DataFrame) or df0.empty:
-                        continue
-                    # find a row that looks like header: contains 'Year' or many month names
-                    best = None
-                    best_score = -1
-                    for ridx in range(min(15, len(df0))):
-                        row = df0.iloc[ridx].astype(str).str.strip()
-                        low = row.str.lower().tolist()
-                        score = 0
-                        score += 5 if "year" in low else 0
-                        score += sum(1 for v in low if v in month_map)
-                        score += sum(1 for v in row if re_year.match(v))
-                        if score > best_score:
-                            best = ridx
-                            best_score = score
-                    if best is not None and best_score >= 3:
-                        hdr = best
-                        dfh = df0.copy()
-                        dfh.columns = dfh.iloc[hdr].astype(str).str.strip()
-                        dfh = dfh.iloc[hdr+1:].reset_index(drop=True)
-                        out[sname] = dfh
-            except Exception:
-                pass
-
-        return out
-
     for path in files:
-        sheets = _read_sheets_any_header(path)
-        if not sheets:
-            logger.debug("No parsable sheets in %s", path.name)
+        # MER bundle contains a state workbook that doesn't match the pattern—skip it
+        if re.search(r"state[_\- ]?data", path.name, flags=re.I):
             continue
 
+        try:
+            if path.suffix.lower() == ".csv":
+                df = pd.read_csv(path, low_memory=False)
+                # very rare in MER zip; keep the old generic CSV branch if you like
+                continue
+            else:
+                sheets = pd.read_excel(path, sheet_name=None, header=None, engine=("openpyxl" if path.suffix.lower() in (".xlsx", ".xlsm") else "xlrd"))
+        except Exception as e:
+            logger.warning("Skip MER file %s: %s", path.name, e)
+            continue
+
+        monthly = None
+        annual = None
         for sname, df in sheets.items():
-            if not isinstance(df, pd.DataFrame) or df.empty:
-                continue
-
-            cols = _flatten_cols(df)
-            low  = [c.lower() for c in cols]
-
-            # Normalize common noise rows
-            df = df.dropna(how="all").copy()
-
-            # Detect Year column
-            ycol = None
-            for key in ("Year", "YEAR", "year"):
-                if key in df.columns:
-                    ycol = key
-                    break
-            if ycol is None and "yyyymm" in low:
-                # tables with YYYYMM numeric value
-                yyyymm_col = df.columns[low.index("yyyymm")]
-                # convert to date
-                ser = pd.to_numeric(df[yyyymm_col], errors="coerce").dropna().astype(int)
-                dt = pd.to_datetime(ser.astype(str), format="%Y%m", errors="coerce")
-                tidy = pd.DataFrame({"date": dt, "raw_symbol": path.stem, "price_close": df.select_dtypes(include=[np.number]).iloc[:, -1]})
-                tidy["symbol"] = tidy["raw_symbol"].map(lambda s: _canonicalize_symbol(s, symbol_map))
-                tidy["src"] = "eia_mer"
-                tidy["unit"] = None
-                tidy["frequency"] = "M"
-                frames.append(tidy[["date", "symbol", "price_close", "src", "unit", "frequency"]])
-                continue
-
-            # Monthly wide (Year + Jan..Dec)
-            month_cols = []
-            for c in df.columns:
-                cl = str(c).strip().lower()
-                if cl in month_map:
-                    month_cols.append(c)
-            # Some tables use full month names with year separated; ensure enough months present
-            is_monthly_wide = ycol is not None and len(month_cols) >= 3
-
-            # Annual wide (Year + 1990..2025 across columns OR tidy year/value)
-            numeric_year_cols = [c for c in df.columns if re_year.match(str(c))]
-
-            # Tidy monthly (Year + Month columns)
-            has_tidy_month = (ycol is not None) and any(c.lower() == "month" for c in df.columns)
-
-            # Pull units if a dedicated column exists
-            unit_col = None
-            for u in ("Unit", "Units", "unit", "units"):
-                if u in df.columns:
-                    unit_col = u
-                    break
-
-            fallback_name = f"{path.stem}:{sname}"
-
-            if is_monthly_wide:
-                name_cols = _pick_name_cols(df, ycol)
-                keep = [ycol] + name_cols + month_cols
-                slim = df[keep].copy()
-
-                long = slim.melt(id_vars=[ycol] + name_cols,
-                                 value_vars=month_cols,
-                                 var_name="month_name",
-                                 value_name="price_close")
-                long = long.dropna(subset=[ycol, "month_name"])
-
-                long["month_num"] = long["month_name"].map(lambda x: month_map.get(str(x).strip().lower(), np.nan))
-                long = long.dropna(subset=["month_num"])
-                long["date"] = pd.to_datetime(dict(
-                    year=pd.to_numeric(long[ycol], errors="coerce").astype("Int64"),
-                    month=long["month_num"].astype(int),
-                    day=1
-                ), errors="coerce")
-                long = long.dropna(subset=["date"])
-
-                long["raw_symbol"] = long.apply(lambda r: _rows_to_symbol(r, name_cols, fallback_name), axis=1)
-                long["symbol"] = long["raw_symbol"].map(lambda s: _canonicalize_symbol(str(s), symbol_map))
-                long["src"] = "eia_mer"
-                long["unit"] = long[unit_col] if unit_col else None
-                long["frequency"] = "M"
-
-                frames.append(long[["date", "symbol", "price_close", "src", "unit", "frequency"]])
-                continue
-
-            if has_tidy_month:
-                name_cols = _pick_name_cols(df, ycol)
-                mcol = next(c for c in df.columns if c.lower() == "month")
-                keep = [ycol, mcol] + name_cols + [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-                slim = df[keep].dropna(subset=[ycol, mcol]).copy()
-
-                # choose the last numeric column as the main series value
-                num_cols = [c for c in slim.columns if pd.api.types.is_numeric_dtype(slim[c])]
-                val_col = num_cols[-1] if num_cols else None
-                if val_col is None:
-                    continue
-
-                # Month could be string ('Jan') or number (1..12)
-                def _to_month(v):
-                    if pd.isna(v):
-                        return np.nan
-                    s = str(v).strip().lower()
-                    if s.isdigit():
-                        n = int(s)
-                        return n if 1 <= n <= 12 else np.nan
-                    return month_map.get(s, np.nan)
-
-                slim["month_num"] = slim[mcol].map(_to_month)
-                slim = slim.dropna(subset=["month_num"])
-
-                slim["date"] = pd.to_datetime(dict(
-                    year=pd.to_numeric(slim[ycol], errors="coerce").astype("Int64"),
-                    month=slim["month_num"].astype(int),
-                    day=1
-                ), errors="coerce")
-                slim = slim.dropna(subset=["date"])
-
-                slim["raw_symbol"] = slim.apply(lambda r: _rows_to_symbol(r, name_cols, fallback_name), axis=1)
-                out = slim.rename(columns={val_col: "price_close"})
-
-                out["symbol"] = out["raw_symbol"].map(lambda s: _canonicalize_symbol(str(s), symbol_map))
-                out["src"] = "eia_mer"
-                out["unit"] = out[unit_col] if unit_col else None
-                out["frequency"] = "M"
-
-                frames.append(out[["date", "symbol", "price_close", "src", "unit", "frequency"]])
-                continue
-
-            if ycol is not None and numeric_year_cols:
-                # Columns are years: melt to 'A'
-                name_cols = _pick_name_cols(df, ycol=None)  # there may not be series names; that's fine
-                keep = name_cols + numeric_year_cols
-                slim = df[keep].copy()
-
-                long = slim.melt(id_vars=name_cols,
-                                 var_name="year",
-                                 value_name="price_close")
-                long["date"] = pd.to_datetime(long["year"].astype(str) + "-01-01", errors="coerce")
-                long = long.dropna(subset=["date"])
-
-                long["raw_symbol"] = long.apply(lambda r: _rows_to_symbol(r, name_cols, fallback_name), axis=1)
-                long["symbol"] = long["raw_symbol"].map(lambda s: _canonicalize_symbol(str(s), symbol_map))
-                long["src"] = "eia_mer"
-                long["unit"] = long[unit_col] if unit_col else None
-                long["frequency"] = "A"
-
-                frames.append(long[["date", "symbol", "price_close", "src", "unit", "frequency"]])
-                continue
-
-            # If we get here, try a last generic path: a single numeric time-like column
-            # e.g., a 'Date' column or 'YYYY-MM' headers across columns
-            # Try YYYYMM headers across columns:
-            ym_cols = [c for c in df.columns if re_monthcode.match(str(c))]
-            if ym_cols:
-                name_cols = _pick_name_cols(df, ycol=None)
-                slim = df[name_cols + ym_cols].copy()
-                long = slim.melt(id_vars=name_cols, var_name="ym", value_name="price_close")
-                long["date"] = pd.to_datetime(long["ym"].astype(str).str.replace(r"[-/]", "", regex=True),
-                                              format="%Y%m", errors="coerce")
-                long = long.dropna(subset=["date"])
-                long["raw_symbol"] = long.apply(lambda r: _rows_to_symbol(r, name_cols, fallback_name), axis=1)
-                long["symbol"] = long["raw_symbol"].map(lambda s: _canonicalize_symbol(str(s), symbol_map))
-                long["src"] = "eia_mer"
-                long["unit"] = long[unit_col] if unit_col else None
-                long["frequency"] = "M"
-                frames.append(long[["date", "symbol", "price_close", "src", "unit", "frequency"]])
-                continue
-
-            # Otherwise skip this sheet
-            logger.debug("Unrecognized MER layout → skip: %s / %s", path.name, sname)
+            s = sname.strip().lower()
+            if "monthly" in s:
+                monthly = _parse_monthly(df, path.stem)
+                if monthly is not None:
+                    frames.append(monthly)
+            elif "annual" in s:
+                annual = _parse_annual(df, path.stem)
+                if annual is not None:
+                    frames.append(annual)
 
     out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=CANON_COLUMNS)
     if out.empty:
         logger.info("No rows parsed from MER folder %s", folder)
         return out
 
-    # finalize; don't force USD because MER mixes units — let unit be None/column if present
+    # finalize; keep native units (do not force USD)
     out = _finalize_frame(out, src="eia_mer", unit_default=None)
 
-    # Prefer monthly where present; if both A and M exist for same symbol & date, keep M
+    # Prefer monthly over annual where both exist
     out["__rank"] = out["frequency"].map({"M": 0, "A": 1}).fillna(2).astype(int)
     out = (out.sort_values(["symbol", "date", "__rank"])
-              .drop_duplicates(["symbol", "date", "src"], keep="first")
+              .drop_duplicates(["symbol", "date"], keep="first")
               .drop(columns="__rank")
               .reset_index(drop=True))
 
