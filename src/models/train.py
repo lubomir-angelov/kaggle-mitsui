@@ -10,9 +10,11 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Subset
 
 from src.models.timexer import build_timexer
 from src.models.adapters.lora import apply_lora_to_attn
+from src.models.data_loader import DynamicDataLoader
 from src.metrics.sharpe_spearman import sharpe_of_daily_spearman
 from src.pretrain.masked_recon import pretrain_masked_reconstruction, ReconHead
 
@@ -301,6 +303,32 @@ def parse_args() -> Args:
     return args
 
 
+def _subset_apply_embargo(subset: Subset, base_ds: DynamicDataLoader, embargo_days: int, val_start: pd.Timestamp) -> Subset:
+    """
+    Remove samples in the embargo window: [val_start - embargo_days, val_start).
+    Assumes `subset.dataset is base_ds` and base_ds has `index_pairs` and `series_dates`.
+    """
+    if embargo_days <= 0:
+        return subset
+
+    idx = np.asarray(subset.indices, dtype=np.int64)
+    # dates for these sample indices
+    dates = np.array([ base_ds.series_dates[s][i] for (s, i) in base_ds.index_pairs[idx] ], dtype='datetime64[ns]')
+    cutoff = (val_start.to_datetime64() - np.timedelta64(embargo_days, "D"))
+    keep = dates < cutoff
+    return Subset(base_ds, idx[keep].tolist())
+
+
+class _PretrainXOnlyWrapper(Dataset):
+    """Wrap a dataset/subset and expose only 'x' for masked reconstruction pretrain."""
+    def __init__(self, base: Dataset):
+        self.base = base
+    def __len__(self) -> int:
+        return len(self.base)
+    def __getitem__(self, i: int):
+        return {"x": self.base[i]["x"]}
+
+
 def main():
     args = parse_args()
 
@@ -316,21 +344,53 @@ def main():
     if args.window < args.patch_size:
         raise ValueError("window must be >= patch_size for patching to work.")
 
-    # ------------ Build windows (global then split by date) ------------
-    arrays_all = build_windows(df, feature_cols, target_cols, window=args.window, min_obs=300)
-    # train/val date split (by end date of window)
-    train_days, emb_days, val_days = make_time_split_by_fraction(
-        dates=df["date"], val_frac=args.val_frac, embargo_days=args.embargo_days
+    # ------------ Dynamic dataset (on-the-fly windows) ------------
+    ds_all = DynamicDataLoader(
+        df=df,
+        feature_cols=feature_cols,
+        target_cols=target_cols,
+        window=args.window,
+        min_obs=300,
+        stride=int(args.stride),          # explicit decimation of end indices
+        min_target_notna=1,               # require at least one target at window end
     )
-    arrays_tr = select_by_dates(arrays_all, train_days)
-    arrays_va = select_by_dates(arrays_all, val_days)
 
-    # Datasets
-    ds_tr = SeqDataset(arrays_tr.X, arrays_tr.y, arrays_tr.date_id)
-    ds_va = SeqDataset(arrays_va.X, arrays_va.y, arrays_va.date_id)
+    # Time split by fraction → cutoff = start of validation span
+    train_days, emb_days, val_days = make_time_split_by_fraction(
+        dates=df["date"],
+        val_frac=float(args.val_frac),
+        embargo_days=int(args.embargo_days),
+    )
+    val_start = val_days[0]
 
-    dl_tr = DataLoader(ds_tr, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True, drop_last=True)
-    dl_va = DataLoader(ds_va, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    # Split the dataset by date (train: < cutoff, valid: >= cutoff)
+    train_ds, valid_ds = ds_all.split_by_date(val_start.to_datetime64())
+
+    # Apply embargo on the training subset explicitly (drop near-future leakage)
+    train_ds = _subset_apply_embargo(train_ds, base_ds=ds_all,
+                                     embargo_days=int(args.embargo_days),
+                                     val_start=val_start)
+
+    # DataLoaders
+    dl_tr = DataLoader(
+        train_ds,
+        batch_size=int(args.batch_size),
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+        drop_last=True,
+    )
+
+    dl_va = DataLoader(
+        valid_ds,
+        batch_size=int(args.batch_size) * 2,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+    )
+
 
     device = args.device
 
@@ -359,14 +419,16 @@ def main():
         # Simpler: reuse model but grab tokens by return_tokens=True and put a small recon head.
         recon_head = ReconHead(d_model=args.d_model, out_channels=len(feature_cols)).to(device)
 
-        # lightweight dataloader that yields only 'x'
-        class PretrainDataset(Dataset):
-            def __init__(self, X): self.X = X
-            def __len__(self): return self.X.shape[0]
-            def __getitem__(self, i): return {"x": torch.tensor(self.X[i], dtype=torch.float32)}
-
-        pre_ds = PretrainDataset(arrays_tr.X)
-        pre_dl = DataLoader(pre_ds, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
+        # lightweight dataloader that yields only 'x' from the *training subset*
+        pre_ds = _PretrainXOnlyWrapper(train_ds)
+        pre_dl = DataLoader(
+            pre_ds,
+            batch_size=int(args.batch_size),
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True,
+        )
 
         # encoder function: patch + blocks → tokens (match masked_recon expectation)
         class EncoderWrapper(nn.Module):
