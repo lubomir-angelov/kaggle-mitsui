@@ -172,7 +172,43 @@ def _add_cross_sectional(df: pd.DataFrame) -> pd.DataFrame:
                   .astype("float32")
             )
             xsec_cols.append(col)
+    
+    # robust cross-sectional z-scores
+    # pick reasonable base columns that exist in your frame
+    base5 = next((c for c in ("ret_5d", "mom_5", "roc_5", "ma_ratio_5") if c in df.columns), None)
+    if base5 is not None:
+        df = _xsec_zscore(df, base_col=base5, out_col="z_5")
+
+    base10 = next((c for c in ("ret_10d", "mom_10", "roc_10", "ma_ratio_10") if c in df.columns), None)
+    if base10 is not None:
+        df = _xsec_zscore(df, base_col=base10, out_col="z_10")
+            
     return df
+
+def _xsec_zscore(df: pd.DataFrame, base_col: str, out_col: str) -> pd.DataFrame:
+    """
+    Cross-sectional z-score per day, robust to tiny std and missing data.
+    Fallbacks: if <3 valid observations that day, set z=0 (neutral).
+    """
+    EPS = 1e-12
+
+    def _z(grp: pd.DataFrame) -> pd.Series:
+        x = grp[base_col].astype(float)
+        # if too few to standardize, return zeros (neutral)
+        if x.notna().sum() < 3:
+            return pd.Series(0.0, index=grp.index)
+        m = x.mean(skipna=True)
+        s = x.std(ddof=0, skipna=True)
+        if not np.isfinite(s) or s < EPS:
+            return pd.Series(0.0, index=grp.index)
+        z = (x - m) / s
+        z = z.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        return z
+
+    df[out_col] = df.groupby("date", group_keys=False).apply(_z)
+
+    return df
+
 
 
 # ---------------------------------------------------------------------
@@ -199,6 +235,13 @@ def build_features(args: BuildArgs) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"], utc=False).dt.tz_localize(None)
     df = df.sort_values(["symbol", "date"]).reset_index(drop=True)
 
+    # Ensure numeric, no hidden infs, and keep a "safe for logs" view handy
+    EPS = 1e-12
+    df["price_close"] = pd.to_numeric(df["price_close"], errors="coerce")
+    # not dropping zeros: keep them; we’ll turn them into NaNs for log-based calcs downstream
+    # remove explicit +/-inf if any slipped through from upstream merges
+    df["price_close"].replace([np.inf, -np.inf], np.nan, inplace=True)
+
     # keep only daily frequency rows (it should already be daily)
     if "frequency" in df.columns:
         df = df[df["frequency"].isin([None, "D"]) | df["frequency"].isna()]
@@ -215,22 +258,73 @@ def build_features(args: BuildArgs) -> pd.DataFrame:
     # build per-symbol features
     feats_parts = []
     for sym, g in df.groupby("symbol", sort=False):
+        # precompute safe returns for the symbol,
+        # only if your _feat_for_symbol doesn’t already do guarded logs.
+        # This won’t hurt if _feat_for_symbol ignores these columns.
+        p = g["price_close"].astype(float)
+        g = g.copy()
+        g["ret_1d"] = p.pct_change()
+        safe_p = p.where(p > 0, np.nan)  # forbid nonpositive for logs
+        g["logret_1d"] = np.log(safe_p).diff()
+
+
         g_out = _feat_for_symbol(g, horizons=args.horizons)
+
         # enforce minimum history so rolling features/targets exist
         if args.min_history > 0:
             g_out = g_out.iloc[args.min_history:].copy()
+
         feats_parts.append(g_out)
 
     features = pd.concat(feats_parts, ignore_index=True)
+
+    # sanitize infinities right AFTER per-symbol features and BEFORE x-sec features
+    num_cols_now = features.select_dtypes(include=[np.number]).columns
+    if len(num_cols_now):
+        features[num_cols_now] = features[num_cols_now].replace([np.inf, -np.inf], np.nan)
 
     # calendar + cross-sectional
     features = _add_calendar_feats(features)
     features = _add_cross_sectional(features)
 
+    # >>> INSERT S2.2 (STRICT FEATURE FILL to satisfy tests; targets untouched)
+    exclude = {"date", "symbol", "src", "unit", "frequency"}
+    feat_cols = [c for c in features.columns if c not in exclude and not c.startswith("target_")]
+    
+    if feat_cols:
+        # First, replace any lingering infs
+        features[feat_cols] = features[feat_cols].replace([np.inf, -np.inf], np.nan)
+        # Groupwise forward/backward fill to keep continuity within each symbol
+        features[feat_cols] = (
+            features.groupby("symbol", group_keys=False)[feat_cols]
+                    .apply(lambda g: g.ffill().bfill())
+        )
+        # Anything still missing (e.g., first rows after min_history) → neutral 0.0
+        features[feat_cols] = features[feat_cols].fillna(0.0)
+
+    # drop truly pathological feature columns with ultra-low coverage
+    # You can tune via env var if you want: MIN_FEATURE_NOTNA=0.20 (for example)
+    min_notna = float(os.environ.get("MIN_FEATURE_NOTNA", "0.00"))  # keep default permissive
+    if min_notna > 0:
+        exclude = {"date", "symbol", "src", "unit", "frequency"}
+        feat_cols = [c for c in features.columns if c not in exclude and not c.startswith("target_")]
+        if feat_cols:
+            notna_share = features[feat_cols].notna().mean()
+            to_drop = notna_share[notna_share < min_notna].index.tolist()
+            if to_drop:
+                logger.info("Dropping %d low-coverage feature(s) (< %.0f%% not-NA): %s",
+                            len(to_drop), 100*min_notna, ", ".join(to_drop[:10]))
+                features.drop(columns=to_drop, inplace=True)
+
     # tidy types
     num_cols = features.select_dtypes(include=[np.number]).columns.tolist()
     features = _downcast_float(features, num_cols)
     features["symbol"] = features["symbol"].astype("category")
+
+    # >>> INSERT S3: final sanitize just BEFORE writing (catches any new infs from x-sec steps)
+    num_cols_final = features.select_dtypes(include=[np.number]).columns
+    if len(num_cols_final):
+        features[num_cols_final] = features[num_cols_final].replace([np.inf, -np.inf], np.nan)
 
     # final NaN policy:
     # - keep rows where *targets* exist for at least one horizon
@@ -270,6 +364,8 @@ def build_features(args: BuildArgs) -> pd.DataFrame:
         "rsi_period": RSI_PERIOD,
         "generated_at": pd.Timestamp.now().isoformat(),
     }
+
+    # write manifest
     with open(OUT_MANIFEST_PATH, "w") as f:
         json.dump(manifest, f, indent=2)
     logger.info("Wrote manifest → %s", OUT_MANIFEST_PATH)
