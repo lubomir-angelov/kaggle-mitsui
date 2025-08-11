@@ -78,12 +78,22 @@ def test_feature_nan_share(features_df: pd.DataFrame) -> None:
 
 
 def test_no_inf_values_in_numeric_columns(features_df: pd.DataFrame) -> None:
+    """Ensure there are no ±inf values in numeric columns. NaNs are allowed and
+    are covered by the separate non-NA coverage test."""
     num_cols = features_df.select_dtypes(include=[np.number]).columns
     if not len(num_cols):
         pytest.skip("No numeric columns found to test for inf values.")
-    bad = ~np.isfinite(features_df[num_cols].to_numpy())
-    has_bad = bool(bad.any())
-    assert not has_bad, "Found inf/-inf/NaN beyond expected NaNs in numeric columns."
+
+    arr = features_df[num_cols].to_numpy()
+    has_inf = np.isinf(arr).any()
+
+    # log any columns with ±inf
+    if has_inf:
+        mask = np.isinf(arr)
+        bad_cols = num_cols[np.any(mask, axis=0)]
+        print("Columns containing ±inf:", list(bad_cols))
+
+    assert not has_inf, "Found ±inf values in numeric columns."
 
 
 def test_business_day_density_sample(features_df: pd.DataFrame) -> None:
