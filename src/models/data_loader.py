@@ -26,11 +26,12 @@ class DynamicDataLoader(Dataset):
         self.series_X: list[np.ndarray] = []
         self.series_y: list[np.ndarray] = []
         self.series_dates: list[np.ndarray] = []
+        self.series_day_ids: list[np.ndarray] = []   # int day IDs (days since 1970-01-01)
         self.series_symid: list[int] = []
 
         index_pairs: list[tuple[int, int]] = []  # (series_idx, end_idx)
 
-        for sid, (sym, g) in enumerate(df.groupby("symbol", sort=False)):
+        for sid, (sym, g) in enumerate(df.groupby("symbol", sort=False, observed=False)):
             g = g.sort_values("date")
             if len(g) < max(window, min_obs):
                 continue
@@ -38,6 +39,9 @@ class DynamicDataLoader(Dataset):
             Xg = g[feature_cols].to_numpy(dtype=np.float32, copy=False)
             yg = g[target_cols].to_numpy(dtype=np.float32, copy=False)
             dg = g["date"].to_numpy(copy=False)
+
+            # Convert to integer day IDs once (days since 1970-01-01)
+            day_ids = dg.astype("datetime64[D]").astype("int32")
 
             targ_mask = np.isfinite(yg).sum(axis=1) >= min_target_notna
 
@@ -57,6 +61,7 @@ class DynamicDataLoader(Dataset):
             self.series_y.append(yg)
             self.series_dates.append(dg)
             self.series_symid.append(sid)
+            self.series_day_ids.append(day_ids) 
 
         self.index_pairs = np.array(index_pairs, dtype=np.int64)
         if self.index_pairs.size == 0:
@@ -70,6 +75,9 @@ class DynamicDataLoader(Dataset):
         Xg = self.series_X[sidx]
         yg = self.series_y[sidx]
         dg = self.series_dates[sidx]
+        day_id = int(self.series_day_ids[sidx][i])
+
+
         # slice window ending at i
         x = Xg[i - self.window + 1 : i + 1]   # (W, C)
         y = yg[i]                              # (P,)
@@ -78,7 +86,7 @@ class DynamicDataLoader(Dataset):
         return {
             "x": torch.from_numpy(x),                      # float32
             "y": torch.from_numpy(y),                      # float32
-            "date_id": torch.tensor(d, dtype=torch.int64),
+            "date_id": torch.tensor(day_id, dtype=torch.int64),
             "sym_id": torch.tensor(self.series_symid[sidx], dtype=torch.int32),
         }
 
