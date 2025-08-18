@@ -16,3 +16,25 @@ se-threads True   --limit-rows 0   --progress-every 1_000_000
 ```
 
 Check the resulting feature_scan.csv manually.
+
+Exepcted results example:
+```bash
+Scanned 51 columns. Flagged 3:
+  - month_start                    | flags=mostly_zero                              | std=0.178 | max=1 | miss=0.00%
+  - month_end                      | flags=mostly_zero                              | std=0.178 | max=1 | miss=0.00%
+  - z_21_xrank                     | flags=z_mean_shift;z_bad_std                   | std=0.299 | max=1 | miss=0.00%
+```
+
+
+month_start, month_end → “mostly_zero”: those are binary calendar flags. 
+
+    Most days are not month boundaries, so zeros dominate.
+    That’s expected and harmless. 
+    We can even store them as bool/int8 to save memory.
+    
+
+z_21_xrank → “z_mean_shift; z_bad_std”: your “xrank” is a percent rank in [0,1] per day. 
+
+    For a uniform variable on [0,1], the expected std is ~0.2887, not 1.0. 
+    The scanner’s “z_*” heuristic assumes z-scores, so it flags the lower std/offset mean (~0.5). 
+    Functionally fine.
