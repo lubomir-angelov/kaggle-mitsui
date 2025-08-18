@@ -1,0 +1,24 @@
+data:
+  window: 160
+  patch_size: 20
+  stride: 20
+model:
+  d_model: 512
+  n_layers: 6
+  n_heads: 8
+  ffn: 2048
+  dropout: 0.1
+train:
+  batch_size: 128
+  lr: 1e-3
+  weight_decay: 0.05
+  epochs_pretrain: 20
+  epochs_finetune: 15
+  early_stop_patience: 4
+lora:
+  enable: true
+  rank: 8
+metric:
+  date_col: date_id
+  target_prefix: target_
+  pred_prefix: prediction_
