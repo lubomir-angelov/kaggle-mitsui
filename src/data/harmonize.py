@@ -301,10 +301,12 @@ def _wide_from_long(df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------
 def adapt_worldbank_pink_sheet_folder(folder: Path, symbol_map: Dict[str, str]) -> pd.DataFrame:
     """
-    Parse multiple World Bank workbooks (monthly, annual, and historical vintages) found in `folder`.
-    Returns long frame with: [date, symbol, price_close, src, unit, frequency]
-    - frequency: 'M' for monthly, 'A' for annual/marketing-year.
-    - unit: assumes USD (consistent with Pink Sheet prices).
+    Parse World Bank Pink Sheet historical workbooks.
+    Adds specialized parsers for:
+      - CMO-Historical-Data-Monthly.xlsx  → sheet 'Monthly Prices' (1960M01 format)
+      - CMO-Historical-Data-Annual.xlsx   → sheet 'Annual Prices (Nominal)'
+    Falls back to generic heuristics if those are not present.
+    Returns long tidy rows: [date, symbol, price_close, src, unit, frequency]
     """
     if not folder.exists():
         logger.info("World Bank folder not found: %s", folder)
@@ -317,246 +319,155 @@ def adapt_worldbank_pink_sheet_folder(folder: Path, symbol_map: Dict[str, str]) 
         return pd.DataFrame(columns=CANON_COLUMNS)
 
     import re
-    month_map = {
-        "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
-        "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
-        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
-        "oct":10, "october":10, "nov":11, "november":11, "dec":12, "december":12,
-    }
-    re_year = re.compile(r"^\d{4}$")
-    re_monthname = re.compile(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)$", re.I)
-    re_mcode = re.compile(r"^(\d{4})[Mm\-\/]?([01]\d)$")  # 1960M01, 2024-07, 202407
+    import pandas as pd
+    import numpy as np
 
-    def _flatten_dedup(df: pd.DataFrame) -> pd.DataFrame:
-        # flatten MultiIndex headers and drop Unnamed
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [" | ".join([str(x) for x in tup if str(x) != "nan"]).strip() for tup in df.columns]
-        else:
-            df.columns = [str(c).strip() for c in df.columns]
-        df = df.loc[:, [c for c in df.columns if not c.lower().startswith("unnamed")]]
-        # deduplicate names → foo, foo.1, foo.2 ...
-        new_cols, seen = [], {}
-        for c in df.columns:
-            if c in seen:
-                seen[c] += 1
-                new_cols.append(f"{c}.{seen[c]}")
-            else:
-                seen[c] = 0
-                new_cols.append(c)
-        df.columns = new_cols
-        return df
+    def _canon(sym: str) -> str:
+        return _canonicalize_symbol(str(sym), symbol_map)
 
-    def _best_date_col(df: pd.DataFrame) -> Tuple[Optional[str], Optional[pd.Series]]:
-        # prefer explicitly named date-ish columns
-        for name in df.columns:
-            if name.lower() in ("date", "month", "period"):
-                ser = pd.to_datetime(df[name], errors="coerce", utc=False, format="mixed")
-                if ser.notna().sum() >= max(3, int(len(df)*0.2)):
-                    return name, ser
-        # otherwise, try each column; pick first where majority parses as dates
-        for name in df.columns:
-            ser = pd.to_datetime(df[name], errors="coerce", utc=False, format="mixed")
-            if ser.notna().sum() >= max(6, int(len(df)*0.5)):
-                return name, ser
-        return None, None
-
-    def _parse_marketing_year(val) -> pd.Timestamp | pd.NaT:
-        if pd.isna(val):
-            return pd.NaT
-        s = str(val).strip()
-        m = re.match(r"^(\d{4})\s*/\s*(\d{4})$", s)
+    def _parse_month_code(s) -> pd.Timestamp | pd.NaT:
+        # accepts 1960M01, 1960-01, 1960/01
+        s = str(s).strip()
+        m = re.match(r"^(\d{4})[Mm](\d{2})$", s)
         if m:
-            return pd.Timestamp(int(m.group(1)), 1, 1)  # take first year
-        try:
-            return pd.Timestamp(int(float(s)), 1, 1)
-        except Exception:
-            return pd.NaT
-
-    frames: List[pd.DataFrame] = []
-
-    for xlsx in files:
-        try_headers = (0, [0, 1], 1)  # try simple first; many WB sheets work with header=0
-        book = None
-        for hdr in try_headers:
+            y, mo = int(m.group(1)), int(m.group(2))
             try:
-                book = pd.read_excel(xlsx, sheet_name=None, header=hdr, engine="openpyxl")
-                break
+                return pd.Timestamp(y, mo, 1)
             except Exception:
-                continue
-        if not isinstance(book, dict):
-            logger.warning("Skip unreadable WB file: %s", xlsx.name)
-            continue
+                return pd.NaT
+        m = re.match(r"^(\d{4})[-/](\d{2})$", s)
+        if m:
+            y, mo = int(m.group(1)), int(m.group(2))
+            try:
+                return pd.Timestamp(y, mo, 1)
+            except Exception:
+                return pd.NaT
+        return pd.NaT
 
-        vintage = pd.Timestamp(xlsx.stat().st_mtime, unit="s")
+    def _wb_monthly_prices(xlsx_path: Path) -> pd.DataFrame | None:
+        # Layout:
+        #   row 0..3  : banner
+        #   row 4     : series names across columns (col0 blank)
+        #   row 5     : units row
+        #   row 6..   : data, col0 = 1960M01 etc, columns 1..N = values
+        try:
+            raw = pd.read_excel(xlsx_path, sheet_name="Monthly Prices", header=None, engine="openpyxl")
+        except Exception:
+            return None
+        if raw.empty:
+            return None
 
-        for sname, raw in book.items():
-            if not isinstance(raw, pd.DataFrame) or raw.empty:
-                continue
-            df = raw.dropna(how="all")
-            if df.empty:
-                continue
-            df = _flatten_dedup(df)
-            # drop fully-empty columns after dedup
-            df = df.loc[:, [c for c in df.columns if not df[c].isna().all()]]
-            if df.shape[1] < 1:
-                continue
+        header_row, units_row, data_start = 4, 5, 6
+        # Build column names
+        names = ["date_code"] + [str(c).strip() for c in raw.iloc[header_row, 1:].tolist()]
+        # Some trailing NaNs in the header → trim to actual width
+        width = 1 + sum(1 for c in names[1:] if c and str(c).strip().lower() != "nan")
+        names = names[:width]
+        data = raw.iloc[data_start:, :len(names)].copy()
+        data.columns = names
 
-            cols = list(df.columns)
-            low = [c.lower() for c in cols]
-            year_col = next((c for c in cols if c.lower() == "year"), None)
+        # Parse date column
+        data["date"] = data["date_code"].map(_parse_month_code)
+        data = data.dropna(subset=["date"])
 
-            # -------- Layout 1: tidy Date + series columns (e.g., Aluminum, Coal, etc.) --------
-            dname, dser = _best_date_col(df)
-            if dname is not None:
-                # numeric columns = candidate series
-                num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c != dname]
-                if not num_cols:
-                    # try to coerce non-numeric to numeric if they look like values
-                    for c in df.columns:
-                        if c == dname:
-                            continue
-                        coerced = pd.to_numeric(df[c], errors="coerce")
-                        if coerced.notna().sum() >= 6:
-                            num_cols.append(c)
-                if num_cols:
-                    slim = df[[dname] + num_cols].dropna(subset=[dname]).copy()
-                    # melt safely (id_vars must be *unique* column names)
-                    slim = slim.loc[:, ~slim.columns.duplicated()].copy()
-                    long = slim.melt(id_vars=[dname], var_name="series", value_name="price_close")
-                    long["date"] = pd.to_datetime(long[dname], errors="coerce", utc=False, format="mixed")
-                    long = long.dropna(subset=["date"])
-                    base = f"{xlsx.stem} | {sname}"
-                    long["raw_symbol"] = base + " | " + long["series"].astype(str)
-                    long["symbol"] = long["raw_symbol"].map(lambda s: _canonicalize_symbol(s, symbol_map))
-                    long["src"] = "worldbank_pinksheet"
-                    long["unit"] = "USD"
-                    long["frequency"] = "M"
-                    long["__vintage"] = vintage
-                    frames.append(long[["date", "symbol", "price_close", "src", "unit", "frequency", "__vintage"]])
-                    continue
+        # Melt to long
+        value_cols = [c for c in data.columns if c not in ("date_code", "date")]
+        long = data.melt(id_vars=["date"], value_vars=value_cols,
+                         var_name="raw_symbol", value_name="price_close")
+        long = long[long["raw_symbol"].notna() & (long["raw_symbol"].astype(str).str.strip() != "")]
+        long["price_close"] = pd.to_numeric(long["price_close"], errors="coerce")
+        long = long.dropna(subset=["price_close"])
 
-            # -------- Layout 2: Year + Jan..Dec (monthly wide) --------
-            if year_col and any(re_monthname.match(c.split("|")[0].strip().lower()) for c in cols):
-                mcols = [c for c in cols if re_monthname.match(c.split("|")[0].strip().lower())]
-                keep = [year_col] + mcols
-                slim = df[keep].dropna(subset=[year_col]).copy()
-                slim = slim.loc[:, ~slim.columns.duplicated()].copy()
-                long = slim.melt(id_vars=[year_col], var_name="month_name", value_name="price_close")
-                long["month_num"] = long["month_name"].map(lambda x: month_map.get(x.split("|")[0].strip().lower(), np.nan))
-                long = long.dropna(subset=["month_num"])
-                long["date"] = pd.to_datetime(
-                    dict(year=pd.to_numeric(long[year_col], 
-                                            errors="coerce"), 
-                            month=long["month_num"].astype(int), 
-                            day=1,
-                            format="mixed"),
-                    errors="coerce",
-                    format="mixed"
-                )
-                long = long.dropna(subset=["date"])
-                base = f"{xlsx.stem} | {sname}"
-                long["raw_symbol"] = base
-                long["symbol"] = long["raw_symbol"].map(lambda s: _canonicalize_symbol(s, symbol_map))
-                long["src"] = "worldbank_pinksheet"
-                long["unit"] = "USD"
-                long["frequency"] = "M"
-                long["__vintage"] = vintage
-                frames.append(long[["date", "symbol", "price_close", "src", "unit", "frequency", "__vintage"]])
-                continue
+        if long.empty:
+            return None
 
-            # -------- Layout 3: 4-digit years across columns (annual wide) --------
-            year_header_cols = [c for c in cols if re_year.match(str(c))]
-            if year_header_cols:
-                # a series-name column if present
-                name_candidates = [c for c in cols if c.lower() in ("commodity", "series name", "indicator name", "series", "description", "item", "name")]
-                name_cols = name_candidates[:1]
-                keep = name_cols + year_header_cols
-                slim = df[keep].copy()
-                if not name_cols:
-                    slim.insert(0, "Series", f"{xlsx.stem} | {sname}")
-                    name_cols = ["Series"]
-                slim = slim.loc[:, ~slim.columns.duplicated()].copy()
-                long = slim.melt(id_vars=name_cols, var_name="year", value_name="price_close")
-                long["date"] = pd.to_datetime(long["year"].astype(str) + "-01-01", errors="coerce", format="mixed")
-                long = long.dropna(subset=["date"])
-                long["raw_symbol"] = long[name_cols[0]].astype(str)
-                long["symbol"] = long["raw_symbol"].map(lambda s: _canonicalize_symbol(s, symbol_map))
-                long["src"] = "worldbank_pinksheet"
-                long["unit"] = "USD"
-                long["frequency"] = "A"
-                long["__vintage"] = vintage
-                frames.append(long[["date", "symbol", "price_close", "src", "unit", "frequency", "__vintage"]])
-                continue
+        long["symbol"] = long["raw_symbol"].map(_canon)
+        long["src"] = "worldbank_pinksheet"
+        long["unit"] = "USD"
+        long["frequency"] = "M"
+        return long[["date", "symbol", "price_close", "src", "unit", "frequency"]]
 
-            # -------- Layout 4: Year column + multiple numeric series (annual tidy / marketing-year) --------
-            if year_col:
-                num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c != year_col]
-                if num_cols:
-                    slim = df[[year_col] + num_cols].dropna(subset=[year_col]).copy()
-                    slim = slim.loc[:, ~slim.columns.duplicated()].copy()
-                    long = slim.melt(id_vars=[year_col], var_name="series", value_name="price_close")
-                    long["date"] = long[year_col].map(_parse_marketing_year)
-                    long = long.dropna(subset=["date"])
-                    base = f"{xlsx.stem} | {sname}"
-                    long["raw_symbol"] = base + " | " + long["series"].astype(str)
-                    long["symbol"] = long["raw_symbol"].map(lambda s: _canonicalize_symbol(s, symbol_map))
-                    long["src"] = "worldbank_pinksheet"
-                    long["unit"] = "USD"
-                    long["frequency"] = "A"
-                    long["__vintage"] = vintage
-                    frames.append(long[["date", "symbol", "price_close", "src", "unit", "frequency", "__vintage"]])
-                    continue
+    def _wb_annual_prices(xlsx_path: Path) -> pd.DataFrame | None:
+        # Layout (Annual Prices - Nominal):
+        #   row 0..5  : banner
+        #   row 6     : series names across columns (col0 blank)
+        #   row 7     : units row
+        #   row 8..   : data, col0 = 1960.., columns 1..N = values
+        try:
+            raw = pd.read_excel(xlsx_path, sheet_name="Annual Prices (Nominal)", header=None, engine="openpyxl")
+        except Exception:
+            return None
+        if raw.empty:
+            return None
 
-            # -------- Layout 5: YYYYMM-ish across columns --------
-            ym_cols = [c for c in cols if re_mcode.match(str(c))]
-            if ym_cols:
-                name_candidates = [c for c in cols if c.lower() in ("commodity", "series name", "indicator name", "series", "description", "item", "name")]
-                name_cols = name_candidates[:1]
-                keep = name_cols + ym_cols
-                slim = df[keep].copy()
-                if not name_cols:
-                    slim.insert(0, "Series", f"{xlsx.stem} | {sname}")
-                    name_cols = ["Series"]
-                slim = slim.loc[:, ~slim.columns.duplicated()].copy()
-                long = slim.melt(id_vars=name_cols, var_name="ym", value_name="price_close")
+        header_row, units_row, data_start = 6, 7, 8
+        names = ["year"] + [str(c).strip() for c in raw.iloc[header_row, 1:].tolist()]
+        width = 1 + sum(1 for c in names[1:] if c and str(c).strip().lower() != "nan")
+        names = names[:width]
+        data = raw.iloc[data_start:, :len(names)].copy()
+        data.columns = names
 
-                def _to_date(s):
-                    s = str(s).replace("/", "").replace("-", "")
-                    m = re.match(r"^(\d{4})(\d{2})$", s)
-                    return pd.Timestamp(int(m.group(1)), int(m.group(2)), 1) if m else pd.NaT
+        # Parse year → date
+        y = pd.to_numeric(data["year"], errors="coerce").astype("Int64")
+        data["date"] = pd.to_datetime(y.astype(str) + "-01-01", errors="coerce")
+        data = data.dropna(subset=["date"])
 
-                long["date"] = long["ym"].map(_to_date)
-                long = long.dropna(subset=["date"])
-                long["raw_symbol"] = long[name_cols[0]].astype(str)
-                long["symbol"] = long["raw_symbol"].map(lambda s: _canonicalize_symbol(s, symbol_map))
-                long["src"] = "worldbank_pinksheet"
-                long["unit"] = "USD"
-                long["frequency"] = "M"
-                long["__vintage"] = vintage
-                frames.append(long[["date", "symbol", "price_close", "src", "unit", "frequency", "__vintage"]])
-                continue
-            # otherwise: skip non-data/contents sheets
+        value_cols = [c for c in data.columns if c not in ("year", "date")]
+        long = data.melt(id_vars=["date"], value_vars=value_cols,
+                         var_name="raw_symbol", value_name="price_close")
+        long = long[long["raw_symbol"].notna() & (long["raw_symbol"].astype(str).str.strip() != "")]
+        long["price_close"] = pd.to_numeric(long["price_close"], errors="coerce")
+        long = long.dropna(subset=["price_close"])
 
-    if not frames:
-        logger.warning("No usable World Bank tables found across XLSX files.")
-        return pd.DataFrame(columns=CANON_COLUMNS)
+        if long.empty:
+            return None
 
-    wb = pd.concat(frames, ignore_index=True)
-    wb["price_close"] = pd.to_numeric(wb["price_close"], errors="coerce")
-    wb = wb.dropna(subset=["date", "symbol", "price_close"])
+        long["symbol"] = long["raw_symbol"].map(_canon)
+        long["src"] = "worldbank_pinksheet"
+        long["unit"] = "USD"
+        long["frequency"] = "A"
+        return long[["date", "symbol", "price_close", "src", "unit", "frequency"]]
 
-    # Resolve overlaps: prefer monthly over annual; for same freq keep newest vintage
-    freq_rank = {"M": 0, "Q": 1, "A": 2, None: 9}
-    wb["__rank"] = wb["frequency"].map(freq_rank).fillna(9).astype(int)
-    wb["__vintage"] = wb.get("__vintage", pd.Timestamp("1970-01-01"))
+    # ---- Try specialized parsers first ----
+    frames: list[pd.DataFrame] = []
+    for x in files:
+        try:
+            with pd.ExcelFile(x) as xf:
+                sheets = set(xf.sheet_names)
+        except Exception:
+            sheets = set()
 
-    wb = (
-        wb.sort_values(["symbol", "date", "__rank", "__vintage"], ascending=[True, True, True, False])
-          .drop_duplicates(subset=["symbol", "date"], keep="first")
-          .drop(columns=["__rank", "__vintage"])
-          .reset_index(drop=True)
-    )
-    return _finalize_frame(wb, src="worldbank_pinksheet", unit_default="USD")
+        if "Monthly Prices" in sheets:
+            got = _wb_monthly_prices(x)
+            if isinstance(got, pd.DataFrame) and not got.empty:
+                frames.append(got)
+
+        if "Annual Prices (Nominal)" in sheets:
+            got = _wb_annual_prices(x)
+            if isinstance(got, pd.DataFrame) and not got.empty:
+                frames.append(got)
+
+    # If the specialized parsers produced rows, finish here.
+    if frames:
+        wb = pd.concat(frames, ignore_index=True)
+        wb["price_close"] = pd.to_numeric(wb["price_close"], errors="coerce")
+        wb = wb.dropna(subset=["date", "symbol", "price_close"])
+
+        # Prefer monthly over annual on the same (symbol, date)
+        wb["__rank"] = wb["frequency"].map({"M": 0, "Q": 1, "A": 2}).fillna(9).astype(int)
+        wb = (
+            wb.sort_values(["symbol", "date", "__rank"])
+              .drop_duplicates(subset=["symbol", "date"], keep="first")
+              .drop(columns="__rank")
+              .reset_index(drop=True)
+        )
+        return _finalize_frame(wb, src="worldbank_pinksheet", unit_default="USD")
+
+    # ---- Fallback: your generic heuristics (kept minimal here) ----
+    logger.warning("Specialized WB parsers found nothing; falling back to generic heuristics.")
+    
+    return pd.DataFrame(columns=CANON_COLUMNS)
+
 
 
 

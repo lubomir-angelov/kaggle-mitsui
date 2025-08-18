@@ -187,26 +187,37 @@ def _add_cross_sectional(df: pd.DataFrame) -> pd.DataFrame:
 
 def _xsec_zscore(df: pd.DataFrame, base_col: str, out_col: str) -> pd.DataFrame:
     """
-    Cross-sectional z-score per day, robust to tiny std and missing data.
-    Fallbacks: if <3 valid observations that day, set z=0 (neutral).
+    Cross-sectional z-score per day for `base_col`, robust to tiny std and missing data.
+    Fallbacks:
+      - if <3 valid observations on a day → z = 0
+      - if std is 0/NaN/inf → z = 0
+    Writes result to `out_col` and returns df.
     """
+    import numpy as np
+
     EPS = 1e-12
 
-    def _z(grp: pd.DataFrame) -> pd.Series:
-        x = grp[base_col].astype(float)
-        # if too few to standardize, return zeros (neutral)
-        if x.notna().sum() < 3:
-            return pd.Series(0.0, index=grp.index)
-        m = x.mean(skipna=True)
-        s = x.std(ddof=0, skipna=True)
-        if not np.isfinite(s) or s < EPS:
-            return pd.Series(0.0, index=grp.index)
-        z = (x - m) / s
-        z = z.replace([np.inf, -np.inf], 0.0).fillna(0.0)
-        return z
+    # mean and std per day, computed on the Series only
+    g = df.groupby("date", observed=False)[base_col]
+    mean = g.transform(lambda s: s.astype(float).mean(skipna=True))
+    std0 = g.transform(lambda s: s.astype(float).std(ddof=0, skipna=True))
 
-    df[out_col] = df.groupby("date", group_keys=False).apply(_z)
+    # safe std (avoid 0/inf)
+    safe_std = std0.where(np.isfinite(std0) & (std0 >= EPS))
 
+    # z-score
+    z = (df[base_col].astype(float) - mean) / safe_std
+
+    # days with too few valid observations → set to 0
+    valid_counts = g.transform(lambda s: s.notna().sum())
+    z = np.where(valid_counts >= 3, z, 0.0)
+
+    # clean up and cast
+    z = pd.Series(z, index=df.index)
+    z = z.replace([np.inf, -np.inf], 0.0).fillna(0.0).astype("float32")
+
+    df[out_col] = z
+    
     return df
 
 
@@ -240,7 +251,8 @@ def build_features(args: BuildArgs) -> pd.DataFrame:
     df["price_close"] = pd.to_numeric(df["price_close"], errors="coerce")
     # not dropping zeros: keep them; we’ll turn them into NaNs for log-based calcs downstream
     # remove explicit +/-inf if any slipped through from upstream merges
-    df["price_close"].replace([np.inf, -np.inf], np.nan, inplace=True)
+    # explicitly, not in place => safe
+    df["price_close"] = df["price_close"].replace([np.inf, -np.inf], np.nan)
 
     # keep only daily frequency rows (it should already be daily)
     if "frequency" in df.columns:
@@ -264,13 +276,13 @@ def build_features(args: BuildArgs) -> pd.DataFrame:
     feats_parts = []
     for sym, g in df.groupby("symbol", sort=False):
         g = g.sort_values("date").copy()
-    
+
         # === FIX B (PER-SYMBOL): trends on log price, not raw ===
         # rolling means / EMAs
         for w in (5, 10, 21, 63, 126):
             g[f"lgsma_{w}"] = g["logp"].rolling(window=w, min_periods=max(2, w // 3)).mean()
             g[f"lgema_{w}"] = g["logp"].ewm(span=w, adjust=False, min_periods=max(2, w // 3)).mean()
-    
+
         # MACD on logp
         MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
         macd_line_log = (
@@ -280,48 +292,48 @@ def build_features(args: BuildArgs) -> pd.DataFrame:
         g["macd_line_log"]   = macd_line_log
         g["macd_signal_log"] = macd_line_log.ewm(span=MACD_SIGNAL, adjust=False).mean()
         g["macd_hist_log"]   = g["macd_line_log"] - g["macd_signal_log"]
-    
+
         # === FIX C (PER-SYMBOL): returns/momentum from logp + winsorize tails ===
         for n in (1, 5, 10, 21, 63, 126):
             g[f"logret_{n}d"] = g["logp"].diff(n)
             g[f"ret_{n}d"]    = np.expm1(g[f"logret_{n}d"])
-    
+
         # winsorize return-like columns per symbol
         ret_like = [c for c in g.columns if c.startswith("ret_") or c.startswith("logret_")]
         for c in ret_like:
             q = g[c].quantile([0.001, 0.999])
             lo, hi = float(q.iloc[0]), float(q.iloc[1])
             g[c] = g[c].clip(lo, hi)
-    
+
         # === FIX D (PER-SYMBOL, OPTIONAL): smoother daily returns for monthly series ===
         # compute 1d log return from time-interpolated logp (do not overwrite logp)
         logp_interp = g.set_index("date")["logp"].interpolate(method="time", limit_direction="both").reset_index(drop=True)
         g["logret_1d"] = logp_interp.diff(1)
         g["ret_1d"]    = np.expm1(g["logret_1d"])
-    
+
         # === FIX F (PER-SYMBOL, OPTIONAL): tame MACD/log-trend extremes ===
         for c in ("macd_line_log", "macd_signal_log", "macd_hist_log"):
             if c in g.columns:
                 q = g[c].quantile([0.001, 0.999])
                 lo, hi = float(q.iloc[0]), float(q.iloc[1])
                 g[c] = g[c].clip(lo, hi)
-    
+
         # hand off to your existing symbol featurizer (it can use the columns above)
         g_out = _feat_for_symbol(g, horizons=args.horizons)
-    
+
         # enforce minimum history so rolling features/targets exist
         if args.min_history > 0:
             g_out = g_out.iloc[args.min_history:].copy()
-    
+
         feats_parts.append(g_out)
-    
+
     features = pd.concat(feats_parts, ignore_index=True)
-    
+
     # sanitize infinities right AFTER per-symbol features and BEFORE x-sec features
     num_cols_now = features.select_dtypes(include=[np.number]).columns
     if len(num_cols_now):
         features[num_cols_now] = features[num_cols_now].replace([np.inf, -np.inf], np.nan)
-    
+
     # === FIX E (GLOBAL, AFTER LOOP): drop unsafe raw-level trend columns ===
     drops = [c for c in features.columns
              if (c.startswith(("sma_", "ema_", "macd_", "mom_")) and not c.endswith("_log"))]
@@ -360,6 +372,31 @@ def build_features(args: BuildArgs) -> pd.DataFrame:
                 logger.info("Dropping %d low-coverage feature(s) (< %.0f%% not-NA): %s",
                             len(to_drop), 100*min_notna, ", ".join(to_drop[:10]))
                 features.drop(columns=to_drop, inplace=True)
+
+    # --- normalized price feature (log + rolling z over 63d) ---
+    # 1) safe log
+    features["p_log"] = np.log(np.clip(features["price_close"].astype(float), 1e-6, None))
+
+    # 2) per-symbol rolling stats
+    grp = features.groupby("symbol", sort=False)
+
+    features["p_log_med63"] = grp["p_log"].transform(
+        lambda s: s.rolling(window=63, min_periods=20).median()
+    )
+
+    features["p_log_std63"] = grp["p_log"].transform(
+        lambda s: s.rolling(window=63, min_periods=20).std(ddof=0)
+    )
+
+    # 3) z-score, guard zero std, clip, and cast
+    features["p_log_z63"] = (
+        (features["p_log"] - features["p_log_med63"]) /
+        features["p_log_std63"].replace(0.0, np.nan)
+    ).clip(-5, 5).astype("float32")
+
+    # 4) tidy
+    features = features.drop(columns=["p_log", "p_log_med63", "p_log_std63"])
+
 
     # tidy types
     num_cols = features.select_dtypes(include=[np.number]).columns.tolist()
