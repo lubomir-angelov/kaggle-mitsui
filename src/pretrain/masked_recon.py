@@ -69,8 +69,15 @@ def pretrain_masked_reconstruction(
                 h = h.repeat_interleave(factor, dim=1)[:, :x.shape[1], :]
 
             xr = recon_head(h)               # (B,T,C)
-            loss = loss_fn(xr[m], x[m])      # reconstruct only masked positions
-
+            mask3 = m.unsqueeze(-1).expand_as(xr)               # (B,T,C) boolean
+            xr_sel = xr[mask3]
+            x_sel  = x[mask3]
+            finite = torch.isfinite(x_sel) & torch.isfinite(xr_sel)
+            if finite.any():
+                loss = loss_fn(xr_sel[finite], x_sel[finite])
+            else:
+                continue  # skip this batch if nothing valid (should be rare)
+            
             opt.zero_grad()
             loss.backward()
             opt.step()

@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data import Subset
+import torch.nn.functional as F
 
 from src.models.timexer import build_timexer
 from src.models.adapters.lora import apply_lora_to_attn
@@ -61,6 +62,44 @@ def make_time_split_by_fraction(
     else:
         emb_days = u[[]]
     return train_days, emb_days, val_days
+
+# ---------------------------------------------------------------------
+# Normalize Data Set, remove NaNs
+# ---------------------------------------------------------------------
+
+def compute_robust_scaler(df: pd.DataFrame, feature_cols: list[str], train_days: pd.DatetimeIndex) -> tuple[np.ndarray, np.ndarray]:
+    train_mask = df["date"].isin(train_days)
+    S = df.loc[train_mask, feature_cols].replace([np.inf, -np.inf], np.nan)
+    mu = S.median().to_numpy(dtype=np.float32)
+    iqr = (S.quantile(0.75) - S.quantile(0.25)).to_numpy(dtype=np.float32)
+    std = S.std(ddof=0).to_numpy(dtype=np.float32)
+
+    # choose a stable scale per feature
+    sigma = np.where(iqr > 1e-6, iqr, std)
+    sigma = np.where(sigma > 1e-6, sigma, 1.0).astype(np.float32)
+    return mu, sigma
+
+
+class NormalizeDataset(Dataset):
+    """Wrap another dataset; standardize x and make it finite."""
+    def __init__(self, base: Dataset, mu: np.ndarray, sigma: np.ndarray, clip: float = 8.0):
+        self.base = base
+        self.mu = torch.tensor(mu, dtype=torch.float32)
+        self.sigma = torch.tensor(sigma, dtype=torch.float32)
+        self.clip = float(clip)
+
+    def __len__(self): 
+        return len(self.base)
+
+    def __getitem__(self, i: int):
+        item = self.base[i]
+        x = item["x"].to(torch.float32)              # (T,C)
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        # (T,C) − (C,) / (C,)
+        x = (x - self.mu) / self.sigma
+        x = torch.clamp(x, -self.clip, self.clip)
+        item["x"] = x
+        return item
 
 
 # ---------------------------------------------------------------------
@@ -178,11 +217,19 @@ def eval_sharpe_spearman(model: nn.Module, loader: DataLoader, device: str,
     Y = np.concatenate(all_y, axis=0)
     P = np.concatenate(all_p, axis=0)
 
-    # build dataframe for metric
     df = pd.DataFrame({"date_id": date_ids})
     for i, tcol in enumerate(target_cols):
-        df[f"target_{tcol}"] = Y[:, i]
-        df[f"prediction_{tcol}"] = P[:, i]
+        # tcol already looks like "target_ret_fwd_5d"
+        df[tcol] = Y[:, i]
+        pred_name = "prediction_" + tcol.replace("target_", "")
+        df[pred_name] = P[:, i]
+    
+    # optional sanity check
+    expected_pred = {"prediction_" + c.replace("target_", "") for c in target_cols}
+    missing = expected_pred - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing prediction columns: {sorted(missing)}")
+
 
     score = sharpe_of_daily_spearman(
         df.rename(columns={"date_id": "date_id"}),
@@ -332,6 +379,9 @@ class _PretrainXOnlyWrapper(Dataset):
 def main():
     args = parse_args()
 
+    print("[boot] parsed args:", json.dumps(vars(args), indent=2), flush=True)
+    print("[boot] FEATURES_PATH:", FEATURES_PATH, "exists:", FEATURES_PATH.exists(), flush=True)
+
     # ------------ Load panel ------------
     df = pd.read_parquet(FEATURES_PATH)
     df["date"] = pd.to_datetime(df["date"], utc=False).dt.tz_localize(None)
@@ -370,6 +420,14 @@ def main():
     train_ds = _subset_apply_embargo(train_ds, base_ds=ds_all,
                                      embargo_days=int(args.embargo_days),
                                      val_start=val_start)
+    
+    # —— robust feature scaling (train-only stats) ——
+    mu, sigma = compute_robust_scaler(df, feature_cols, train_days)
+
+    # wrap both subsets so pretrain AND finetune see normalized inputs
+    train_ds = NormalizeDataset(train_ds, mu, sigma, clip=8.0)
+    valid_ds = NormalizeDataset(valid_ds, mu, sigma, clip=8.0)
+
 
     # DataLoaders
     dl_tr = DataLoader(
