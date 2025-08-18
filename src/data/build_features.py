@@ -255,33 +255,78 @@ def build_features(args: BuildArgs) -> pd.DataFrame:
                     len(dropped), args.min_obs_per_symbol, ", ".join(dropped[:10]))
     df = df[df["symbol"].isin(keep_syms)].copy()
 
+    # === FIX A (GLOBAL, BEFORE LOOP): stabilize raw level ===
+    df["price_close"] = pd.to_numeric(df["price_close"], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    df = df[df["price_close"] > 0].copy()                    # forbid non-positive for logs
+    df["logp"] = np.log(df["price_close"]).astype(np.float64)
+
     # build per-symbol features
     feats_parts = []
     for sym, g in df.groupby("symbol", sort=False):
-        # precompute safe returns for the symbol,
-        # only if your _feat_for_symbol doesn’t already do guarded logs.
-        # This won’t hurt if _feat_for_symbol ignores these columns.
-        p = g["price_close"].astype(float)
-        g = g.copy()
-        g["ret_1d"] = p.pct_change()
-        safe_p = p.where(p > 0, np.nan)  # forbid nonpositive for logs
-        g["logret_1d"] = np.log(safe_p).diff()
-
-
+        g = g.sort_values("date").copy()
+    
+        # === FIX B (PER-SYMBOL): trends on log price, not raw ===
+        # rolling means / EMAs
+        for w in (5, 10, 21, 63, 126):
+            g[f"lgsma_{w}"] = g["logp"].rolling(window=w, min_periods=max(2, w // 3)).mean()
+            g[f"lgema_{w}"] = g["logp"].ewm(span=w, adjust=False, min_periods=max(2, w // 3)).mean()
+    
+        # MACD on logp
+        MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
+        macd_line_log = (
+            g["logp"].ewm(span=MACD_FAST, adjust=False).mean()
+            - g["logp"].ewm(span=MACD_SLOW, adjust=False).mean()
+        )
+        g["macd_line_log"]   = macd_line_log
+        g["macd_signal_log"] = macd_line_log.ewm(span=MACD_SIGNAL, adjust=False).mean()
+        g["macd_hist_log"]   = g["macd_line_log"] - g["macd_signal_log"]
+    
+        # === FIX C (PER-SYMBOL): returns/momentum from logp + winsorize tails ===
+        for n in (1, 5, 10, 21, 63, 126):
+            g[f"logret_{n}d"] = g["logp"].diff(n)
+            g[f"ret_{n}d"]    = np.expm1(g[f"logret_{n}d"])
+    
+        # winsorize return-like columns per symbol
+        ret_like = [c for c in g.columns if c.startswith("ret_") or c.startswith("logret_")]
+        for c in ret_like:
+            q = g[c].quantile([0.001, 0.999])
+            lo, hi = float(q.iloc[0]), float(q.iloc[1])
+            g[c] = g[c].clip(lo, hi)
+    
+        # === FIX D (PER-SYMBOL, OPTIONAL): smoother daily returns for monthly series ===
+        # compute 1d log return from time-interpolated logp (do not overwrite logp)
+        logp_interp = g.set_index("date")["logp"].interpolate(method="time", limit_direction="both").reset_index(drop=True)
+        g["logret_1d"] = logp_interp.diff(1)
+        g["ret_1d"]    = np.expm1(g["logret_1d"])
+    
+        # === FIX F (PER-SYMBOL, OPTIONAL): tame MACD/log-trend extremes ===
+        for c in ("macd_line_log", "macd_signal_log", "macd_hist_log"):
+            if c in g.columns:
+                q = g[c].quantile([0.001, 0.999])
+                lo, hi = float(q.iloc[0]), float(q.iloc[1])
+                g[c] = g[c].clip(lo, hi)
+    
+        # hand off to your existing symbol featurizer (it can use the columns above)
         g_out = _feat_for_symbol(g, horizons=args.horizons)
-
+    
         # enforce minimum history so rolling features/targets exist
         if args.min_history > 0:
             g_out = g_out.iloc[args.min_history:].copy()
-
+    
         feats_parts.append(g_out)
-
+    
     features = pd.concat(feats_parts, ignore_index=True)
-
+    
     # sanitize infinities right AFTER per-symbol features and BEFORE x-sec features
     num_cols_now = features.select_dtypes(include=[np.number]).columns
     if len(num_cols_now):
         features[num_cols_now] = features[num_cols_now].replace([np.inf, -np.inf], np.nan)
+    
+    # === FIX E (GLOBAL, AFTER LOOP): drop unsafe raw-level trend columns ===
+    drops = [c for c in features.columns
+             if (c.startswith(("sma_", "ema_", "macd_", "mom_")) and not c.endswith("_log"))]
+    if drops:
+        features.drop(columns=drops, inplace=True, errors="ignore")
 
     # calendar + cross-sectional
     features = _add_calendar_feats(features)

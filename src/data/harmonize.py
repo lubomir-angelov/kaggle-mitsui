@@ -164,6 +164,8 @@ def _finalize_frame(df: pd.DataFrame, src: str, unit_default: str = "USD") -> pd
     df["date"] = _coerce_datetime(df["date"])
     df["symbol"] = df["symbol"].astype(str)
     df["price_close"] = pd.to_numeric(df["price_close"], errors="coerce")
+    # guard: keep only strictly positive prices (avoids later log/return pathologies)
+    df = df[df["price_close"] > 0]
     df["src"] = src
     if "unit" not in df.columns:
         df["unit"] = unit_default
@@ -421,7 +423,7 @@ def adapt_worldbank_pink_sheet_folder(folder: Path, symbol_map: Dict[str, str]) 
                     # melt safely (id_vars must be *unique* column names)
                     slim = slim.loc[:, ~slim.columns.duplicated()].copy()
                     long = slim.melt(id_vars=[dname], var_name="series", value_name="price_close")
-                    long["date"] = pd.to_datetime(df[dname], errors="coerce", utc=False, format="mixed")
+                    long["date"] = pd.to_datetime(long[dname], errors="coerce", utc=False, format="mixed")
                     long = long.dropna(subset=["date"])
                     base = f"{xlsx.stem} | {sname}"
                     long["raw_symbol"] = base + " | " + long["series"].astype(str)
