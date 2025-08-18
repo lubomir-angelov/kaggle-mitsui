@@ -507,7 +507,7 @@ def main():
                 "val_sharpe_spearman": float(val_score),
                 "train_loss": float(train_loss),
                 "n_train_samples": int(len(train_ds)),
-                "n_val_samples": int(len(dl_va)),
+                "n_val_samples": int(len(valid_ds)),
             }
             with open(out_dir / "val_report.json", "w") as f:
                 json.dump(rep, f, indent=2)
