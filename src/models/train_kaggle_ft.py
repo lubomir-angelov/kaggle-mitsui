@@ -513,7 +513,7 @@ if __name__ == "__main__":
         lora_rank=8,
         # "last_run.txt").read_text().strip() + # for later runs
         resume_ckpt=str(DATA_MODELS / "timexer" / "best.pt"),
-        out_run_name="kaggle_ft_v2",
+        out_run_name="kaggle_ft_v3",
     )
 
     main(cfg)  # run the training script with the specified config
