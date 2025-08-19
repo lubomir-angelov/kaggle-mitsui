@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse, json, os
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 
@@ -223,7 +224,7 @@ def eval_sharpe_spearman(model: nn.Module, loader: DataLoader, device: str,
         df[tcol] = Y[:, i]
         pred_name = "prediction_" + tcol.replace("target_", "")
         df[pred_name] = P[:, i]
-    
+
     # optional sanity check
     expected_pred = {"prediction_" + c.replace("target_", "") for c in target_cols}
     missing = expected_pred - set(df.columns)
@@ -266,6 +267,9 @@ class Args:
     pretrain_epochs: int
     pretrain_mask_ratio: float
     pretrain_span: int
+    # running from checkpoint
+    run_name: Optional[str]
+    resume_from: Optional[str]
 
 def parse_args() -> Args:
     import yaml
@@ -346,6 +350,10 @@ def parse_args() -> Args:
         pretrain_epochs=_get_int(t, "epochs_pretrain", 0),
         pretrain_mask_ratio=_get_float(t, "mask_ratio", 0.2),
         pretrain_span=_get_int(t, "span", 4),
+
+        # run from checkpoint
+        run_name=t.get("run_name"), # None if absent
+        resume_from=t.get("resume_from"), # None if absent
     )
     return args
 
@@ -378,6 +386,19 @@ class _PretrainXOnlyWrapper(Dataset):
 
 def main():
     args = parse_args()
+
+    # Allow an explicit run name via YAML > ENV > timestamp:
+    run_name = args.run_name or os.environ.get("RUN_NAME") or datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+    out_dir = DATA_MODELS / "timexer" / run_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pointers/metadata
+    with open(DATA_MODELS / "timexer" / "last_run.txt", "w") as f:
+        f.write(str(out_dir))
+
+    ckpt_path = out_dir / "best.pt"
 
     print("[boot] parsed args:", json.dumps(vars(args), indent=2), flush=True)
     print("[boot] FEATURES_PATH:", FEATURES_PATH, "exists:", FEATURES_PATH.exists(), flush=True)
@@ -470,6 +491,35 @@ def main():
     if args.lora:
         apply_lora_to_attn(model, r=args.lora_rank, alpha=2*args.lora_rank, freeze_base=True)
 
+    # ------------ Optional resume ------------
+    resume_blob = None
+    resume_from = args.resume_from
+    start_epoch = 1
+    best_score = -1e9
+
+    if resume_from:
+        print(f"[resume] loading {resume_from}")
+        ckpt = torch.load(resume_from, map_location=args.device)
+        resume_blob = ckpt  # stash for loading optim/sched later
+
+        # load model state
+        model.load_state_dict(ckpt["model"], strict=False)
+
+        # keep track of the best metric and epoch if present
+        best_score = float(ckpt.get("best_score", -1e9))
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+
+        # (optional) sanity checks on schema compatibility
+        prev_feats = ckpt.get("feature_cols", feature_cols)
+        prev_tgts  = ckpt.get("target_cols", target_cols)
+        if prev_feats != feature_cols:
+            print("[warn] feature column set changed vs checkpoint.")
+        if prev_tgts != target_cols:
+            print("[warn] target column set changed vs checkpoint.")
+
+        # we are reesuming training, so no pretrain epochs
+        args.pretrain_epochs = 0
+
     # ------------ Optional masked-span pretrain ------------
     if args.pretrain_epochs > 0:
         print(f"[pretrain] epochs={args.pretrain_epochs}, mask_ratio={args.pretrain_mask_ratio}, span={args.pretrain_span}")
@@ -518,15 +568,29 @@ def main():
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=max(1, args.epochs))
 
-    best_score = -1e9
-    out_dir = DATA_MODELS / "timexer"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = out_dir / "best.pt"
+    # NEW: restore optimizer & scheduler states on resume
+    if resume_blob is not None:
+        if "optim" in resume_blob:
+            try:
+                optim.load_state_dict(resume_blob["optim"])
+                print("[resume] optimizer state restored")
+            except Exception as e:
+                print(f"[resume] optimizer state not loaded: {e}")
+        if "sched" in resume_blob:
+            try:
+                sched.load_state_dict(resume_blob["sched"])
+                print("[resume] scheduler state restored")
+            except Exception as e:
+                print(f"[resume] scheduler state not loaded: {e}")
+
+    patience = int(args.early_stop_patience)
+    bad = 0
 
     for ep in range(1, args.epochs + 1):
         model.train()
         total = 0.0
         steps = 0
+
         for batch in dl_tr:
             x = batch["x"].to(device)          # (B,T,C)
             y = batch["y"].to(device)          # (B,P)
@@ -539,7 +603,8 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optim.step()
 
-            total += float(loss.item()); steps += 1
+            total += float(loss.item())
+            steps += 1
 
         sched.step()
         train_loss = total / max(1, steps)
@@ -547,18 +612,29 @@ def main():
         # validation: Sharpe of daily Spearman
         val_score, val_frame = eval_sharpe_spearman(model, dl_va, device, target_cols)
 
-        print(f"[{ep:03d}/{args.epochs}] train_loss={train_loss:.6f}  val_SharpeSpearman={val_score:.4f}  lr={sched.get_last_lr()[0]:.2e}")
+        current_epoch = start_epoch + ep - 1
+        total_epochs  = start_epoch + args.epochs - 1
+        print(f"[{current_epoch:03d}/{total_epochs}] "
+              f"train_loss={train_loss:.6f}  val_SharpeSpearman={val_score:.4f}  lr={sched.get_last_lr()[0]:.2e}")
+
+
+        #print(f"[{ep:03d}/{args.epochs}] train_loss={train_loss:.6f}  val_SharpeSpearman={val_score:.4f}  lr={sched.get_last_lr()[0]:.2e}")
 
         # keep best
         if val_score > best_score:
             best_score = val_score
+            bad = 0
             torch.save({
-                "model": model.state_dict(),
-                "args": vars(args),
-                "feature_cols": feature_cols,
-                "target_cols": target_cols,
-                "best_score": best_score,
-            }, ckpt_path)
+                    "model": model.state_dict(),
+                    "optim": optim.state_dict(),
+                    "sched": sched.state_dict(),
+                    "epoch": ep,
+                    "args": vars(args),
+                    "feature_cols": feature_cols,
+                    "target_cols": target_cols,
+                    "best_score": float(best_score),
+                }, ckpt_path)
+            
             # also persist a small val report
             rep = {
                 "epoch": ep,
@@ -574,6 +650,11 @@ def main():
                 val_frame.to_parquet(out_dir / "val_preds.parquet", index=False)
             except Exception:
                 pass
+        else:
+            bad += 1
+            if patience > 0 and bad >= patience:
+                print(f"[early-stop] no improvement for {patience} epochs; stopping.")
+                break
 
     print(f"Best val SharpeSpearman = {best_score:.4f}")
     print(f"Saved best checkpoint → {ckpt_path}")
