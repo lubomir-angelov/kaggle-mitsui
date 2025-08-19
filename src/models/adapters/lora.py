@@ -34,15 +34,27 @@ class LoRALinear(nn.Module):
         self.scale        = alpha / r if r > 0 else 0.0
         self.freeze_base  = freeze_base
 
-        # copy base
-        self.weight = nn.Parameter(base.weight.data.clone(), requires_grad=not freeze_base)
-        self.bias   = nn.Parameter(base.bias.data.clone() if base.bias is not None else torch.zeros(self.out_features),
-                                   requires_grad=not freeze_base)
+        
+        device = base.weight.device
+        dtype  = base.weight.dtype
 
-        # LoRA params
+        # copy base params onto the same device/dtype
+        self.weight = nn.Parameter(
+            base.weight.detach().clone().to(device=device, dtype=dtype),
+            requires_grad=not freeze_base
+        )
+        if base.bias is not None:
+            self.bias = nn.Parameter(
+                base.bias.detach().clone().to(device=device, dtype=dtype),
+                requires_grad=not freeze_base
+            )
+        else:
+            self.bias = None
+
+        # LoRA params on same device/dtype
         if r > 0:
-            self.A = nn.Parameter(torch.zeros(self.r, self.out_features))
-            self.B = nn.Parameter(torch.zeros(self.in_features, self.r))
+            self.A = nn.Parameter(torch.zeros(self.r, self.out_features, device=device, dtype=dtype))
+            self.B = nn.Parameter(torch.zeros(self.in_features, self.r, device=device, dtype=dtype))
             nn.init.kaiming_uniform_(self.B, a=math.sqrt(5))
             nn.init.zeros_(self.A)
         else:

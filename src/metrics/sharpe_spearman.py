@@ -11,48 +11,39 @@ def sharpe_of_daily_spearman(
     date_col: str      = "date_id",
 ) -> float:
     """
-    Kaggle Mitsui metric: for each date, compute the mean Spearman rank correlation
-    across all targets; then return mean/std (Sharpe) across dates.
+    For each date, compute Spearman correlation ACROSS TARGETS between
+    target_* and prediction_* vectors. Then return mean/std (Sharpe) across dates.
 
-    df: must contain columns: date_id, target_*, prediction_*
+    The frame may have multiple rows per date; we collapse them by mean first.
     """
-    # gather columns
+    # collect and align columns by suffix
     target_cols = [c for c in df.columns if c.startswith(target_prefix)]
-    pred_cols   = [c for c in df.columns if c.startswith(pred_prefix)]
-    assert len(target_cols) == len(pred_cols) and len(target_cols) > 0, "Mismatched target/pred columns"
+    assert len(target_cols) > 0, "No target_* columns found"
 
-    # align target_i with prediction_i by suffix
-    suffix = [c.replace(target_prefix, "") for c in target_cols]
-    pred_cols = [f"{pred_prefix}{s}" for s in suffix]
-    for c in pred_cols:
-        if c not in df.columns:
-            raise ValueError(f"Missing prediction column: {c}")
+    suffixes   = [c[len(target_prefix):] for c in target_cols]
+    pred_cols  = [f"{pred_prefix}{s}" for s in suffixes]
+    missing    = [c for c in pred_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing prediction columns: {missing[:3]}...")
 
-    daily_scores = []
-    for dt, g in df.groupby(date_col):
-        # per target correlation on this date (across rows/assets)
-        scores = []
-        for tcol, pcol in zip(target_cols, pred_cols):
-            tgt = g[tcol].values
-            prd = g[pcol].values
-            if np.all(np.isnan(tgt)) or np.all(np.isnan(prd)):
-                continue
-            # handle constant arrays / nan-safe
-            if np.nanstd(tgt) == 0 or np.nanstd(prd) == 0:
-                continue
-            rho, _ = spearmanr(tgt, prd, nan_policy="omit")
+    # collapse to one row per date (in case there are duplicates)
+    T = df.groupby(date_col, as_index=True)[target_cols].mean(numeric_only=True)
+    P = df.groupby(date_col, as_index=True)[pred_cols].mean(numeric_only=True)
+
+    daily_rhos = []
+    for d in T.index:
+        t = T.loc[d].to_numpy(dtype=float)
+        p = P.loc[d].to_numpy(dtype=float)
+        m = np.isfinite(t) & np.isfinite(p)
+        if m.sum() >= 2:
+            rho = spearmanr(t[m], p[m], nan_policy="omit").correlation
             if np.isfinite(rho):
-                scores.append(rho)
-        if scores:
-            daily_scores.append(np.mean(scores))
+                daily_rhos.append(rho)
 
-    if len(daily_scores) < 2:
-        # std would be zero/undefined; return 0 to be safe in early training
+    if not daily_rhos:
         return 0.0
-
-    arr = np.array(daily_scores, dtype=float)
-    mean = arr.mean()
-    std  = arr.std(ddof=0)
+    arr = np.asarray(daily_rhos, dtype=float)
+    std = arr.std(ddof=0)
     if std == 0:
         return 0.0
-    return float(mean / std)
+    return float(arr.mean() / std)
